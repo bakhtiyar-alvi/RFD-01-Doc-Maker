@@ -2,14 +2,57 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <!-- Removed user-scalable=no so mobile users can pinch-zoom wide tables & pass Lighthouse PWA checks -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1B365D">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="GST RFD-01">
   <title>Peak GST RFD-01 Form &amp; Document Maker PWA</title>
 
-  <!-- Inline Web App Manifest for TrebEdit / Mobile Home Screen Installation -->
-  <link rel="manifest" href="manifest.json">
+  <!-- 1. Direct Browser & Home Screen Fallback Icons (CRITICAL FOR CHROME LOGO) -->
+  <link id="faviconLink192" rel="icon" type="image/png" sizes="192x192" href="./Logo.png">
+  <link id="faviconLink512" rel="icon" type="image/png" sizes="512x512" href="./Logo.png">
+  <link id="appleTouchIconLink" rel="apple-touch-icon" sizes="180x180" href="./Logo.png">
+
+  <!-- 2. Web App Manifest -->
+  <link id="pwaManifestLink" rel="manifest" href="./manifest.json">
+
+  <!-- 3. Auto-Square Icon Normalizer (Fixes non-square Logo.png so Chrome never drops the icon) -->
+  <script>
+    (function ensureSquarePwaIcons() {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = function () {
+        try {
+          function makeSquareIcon(size) {
+            const c = document.createElement("canvas");
+            c.width = size;
+            c.height = size;
+            const ctx = c.getContext("2d");
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, size, size);
+            const pad = Math.round(size * 0.08);
+            const avail = size - pad * 2;
+            const scale = Math.min(avail / img.width, avail / img.height);
+            const w = Math.round(img.width * scale);
+            const h = Math.round(img.height * scale);
+            ctx.drawImage(img, Math.round((size - w) / 2), Math.round((size - h) / 2), w, h);
+            return c.toDataURL("image/png");
+          }
+          const icon192 = makeSquareIcon(192);
+          const icon512 = makeSquareIcon(512);
+          document.getElementById("faviconLink192").href = icon192;
+          document.getElementById("faviconLink512").href = icon512;
+          document.getElementById("appleTouchIconLink").href = icon192;
+        } catch (e) {
+          console.warn("Canvas icon normalizer skipped:", e.message);
+        }
+      };
+      img.src = "./Logo.png";
+    })();
+  </script>
 
   <!-- PDF.js CDN for parsing Monthly GSTR-3B PDFs directly in browser -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -367,6 +410,8 @@
         </select>
         <button class="btn btn-sm btn-outline" style="background:#fff;" onclick="openCompanyModal('edit')">Edit Firm</button>
         <button class="btn btn-sm btn-warning" onclick="openCompanyModal('new')">+ New Firm</button>
+        <button id="btnInstallPwa" class="btn btn-sm btn-success" style="display:none;" onclick="triggerPwaInstall()">📲 Install App</button>
+        
         <button class="btn btn-sm btn-outline" style="background:#f8fafc;" onclick="switchTab('tab-settings', document.getElementById('tabBtnSettings'))">⚙ Settings &amp; Backup</button>
       </div>
     </div>
@@ -1969,7 +2014,12 @@
      ELECTRONIC CREDIT & CASH LEDGER (.CSV/.JSON) ENGINE & SCHEMA UPDATER
      ===================================================================== */
 
-  // 9. Parse Prepared Statement 1A / Statement 2 / 3 (.json)
+  // Strict 2-Decimal Rounding Helper (Eliminates IEEE-754 Floating-Point Drift)
+  function r2(num) {
+    return Math.round(((Number(num) || 0) + Number.EPSILON) * 100) / 100;
+  }
+
+  // 9. Parse Prepared Statement 1A / Statement 2 / 3 (.json) — Patched for Export Stmt 2/3 & r2()
   function handleStmt1AUpload(event) {
     const file = event.target.files[0];
     if (!file) return;
@@ -1985,21 +2035,53 @@
 
         const stmtKey = Object.keys(data).find(k => Array.isArray(data[k])) || "stmt01A";
         const rows = data[stmtKey] || [];
-        let inCount = 0, outCount = 0;
+        const isExportStmt = (
+          /^stmt0[23]$/i.test(stmtKey) ||
+          data.refundRsn === "EXPWP" ||
+          data.refundRsn === "EXPWOP"
+        );
 
+        let inCount = 0, outCount = 0;
         const excludedInward = APP_STATE.inwardInvoices.filter(x => x.cat === "Excluded");
         const existingNonInvOutward = APP_STATE.outwardInvoices.filter(x => !x.isInv);
         const newInward = [];
         const newOutward = [];
 
         rows.forEach(r => {
+          // Case 1: Statement 2 / Statement 3 (Export Outward Invoices using inum / txval / val)
+          if (isExportStmt && r.inum !== undefined && r.oinum === undefined) {
+            outCount++;
+            const oval = r2(r.txval !== undefined ? r.txval : r.val);
+            const oiamt = r2(r.iamt);
+            const invVal = r2(r.val !== undefined ? r.val : (oval + oiamt));
+            const rt = oval > 0 ? Math.round((oiamt / oval) * 100) : 0;
+            newOutward.push({
+              prd: dateToPeriodMMYYYY(r.idt),
+              ctin: r.sbpcode ? `EXPORT (${r.sbpcode})` : "EXPORT SUPPLY",
+              inum: String(r.inum),
+              idt: String(r.idt || "").replace(/\//g, "-"),
+              rt,
+              val: oval,
+              camt: 0,
+              samt: 0,
+              iamt: oiamt,
+              invVal,
+              isInv: true,
+              sbpcode: r.sbpcode || "",
+              sbnum: String(r.sbnum || ""),
+              sbdt: String(r.sbdt || "")
+            });
+            return;
+          }
+
+          // Case 2: Standard Statement 1A Inward Supply Row
           if (r.inum !== undefined && r.val !== undefined) {
             inCount++;
-            const val = Number(r.val) || 0;
-            const camt = Number(r.camt) || 0;
-            const samt = Number(r.samt) || 0;
-            const iamt = Number(r.iamt) || 0;
-            const totTax = camt + samt + iamt;
+            const val = r2(r.val);
+            const camt = r2(r.camt);
+            const samt = r2(r.samt);
+            const iamt = r2(r.iamt);
+            const totTax = r2(camt + samt + iamt);
             const rt = val > 0 ? Math.round((totTax / val) * 100) : 18;
             const matchExisting = APP_STATE.inwardInvoices.find(
               x => (x.stin || "") === (r.stin || "") && String(x.inum) === String(r.inum)
@@ -2019,13 +2101,14 @@
             });
           }
 
+          // Case 3: Standard Statement 1A Outward Supply Row (B2B or B2C Summary)
           if (r.oinum !== undefined && r.oval !== undefined) {
             outCount++;
-            const oval = Number(r.oval) || 0;
-            const ocamt = Number(r.ocamt) || 0;
-            const osamt = Number(r.osamt) || 0;
-            const oiamt = Number(r.oiamt) || 0;
-            const totTax = ocamt + osamt + oiamt;
+            const oval = r2(r.oval);
+            const ocamt = r2(r.ocamt);
+            const osamt = r2(r.osamt);
+            const oiamt = r2(r.oiamt);
+            const totTax = r2(ocamt + osamt + oiamt);
             const rt = oval > 0 ? Math.round((totTax / oval) * 100) : 5;
             const matchOut = APP_STATE.outwardInvoices.find(
               x => String(x.inum).replace(/^0+/, "") === String(r.oinum).replace(/^0+/, "")
@@ -2036,14 +2119,14 @@
               inum: String(r.oinum),
               idt: String(r.oidt || "").replace(/\//g, "-"),
               rt, val: oval, camt: ocamt, samt: osamt, iamt: oiamt,
-              invVal: +(oval + totTax).toFixed(2),
+              invVal: r2(oval + totTax),
               isInv: true
             });
           } else if (r.ostype === "B2C" && r.oval !== undefined) {
-            setNumVal("othB2cInvVal", Number(r.oval) || 0);
-            setNumVal("othB2cInvCgst", Number(r.ocamt) || 0);
-            setNumVal("othB2cInvSgst", Number(r.osamt) || 0);
-            setNumVal("othB2cInvIgst", Number(r.oiamt) || 0);
+            setNumVal("othB2cInvVal", r2(r.oval));
+            setNumVal("othB2cInvCgst", r2(r.ocamt));
+            setNumVal("othB2cInvSgst", r2(r.osamt));
+            setNumVal("othB2cInvIgst", r2(r.oiamt));
             APP_STATE.otherTables.b2cInvCount = 1;
             setTextVal("othB2cInvCount", "1");
           }
@@ -2054,10 +2137,10 @@
         APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
 
         setTextVal("statusStmt1A", `✓ Imported ${file.name}: ${inCount} Inward & ${outCount} Outward Invoices`);
-        logImportMessage(`Imported Statement 1A (${file.name}): ${inCount} eligible inward invoices and ${outCount} inverted outward invoices.`);
+        logImportMessage(`Imported ${stmtKey} (${file.name}): ${inCount} eligible inward invoices and ${outCount} qualifying outward invoices.`);
         recalculateAll();
       } catch (err) {
-        alert("Error parsing Statement 1A JSON: " + err.message);
+        alert("Error parsing Statement JSON: " + err.message);
       }
     };
     reader.readAsText(file);
@@ -2082,11 +2165,11 @@
         }
         const excludedInward = APP_STATE.inwardInvoices.filter(x => x.cat === "Excluded");
         const parsedInward = invoices.map(inv => {
-          const val = Number(inv.val) || 0;
-          const camt = Number(inv.camt) || 0;
-          const samt = Number(inv.samt) || 0;
-          const iamt = Number(inv.iamt) || 0;
-          const tot = camt + samt + iamt;
+          const val = r2(inv.val);
+          const camt = r2(inv.camt);
+          const samt = r2(inv.samt);
+          const iamt = r2(inv.iamt);
+          const tot = r2(camt + samt + iamt);
           const rt = val > 0 ? Math.round((tot / val) * 100) : 18;
           return {
             stin: inv.stin || "",
@@ -2153,11 +2236,11 @@
       (sup.inv || []).forEach(inv => {
         const inum = String(inv.inum || "").trim();
         const idt = String(inv.dt || "").replace(/\//g, "-").trim();
-        const val = Number(inv.txval) || 0;
-        const camt = Number(inv.cgst) || 0;
-        const samt = Number(inv.sgst) || 0;
-        const iamt = Number(inv.igst) || 0;
-        const tot = camt + samt + iamt;
+        const val = r2(inv.txval);
+        const camt = r2(inv.cgst);
+        const samt = r2(inv.sgst);
+        const iamt = r2(inv.igst);
+        const tot = r2(camt + samt + iamt);
         const rt = val > 0 ? Math.round((tot / val) * 100) : 18;
         const cat = (inv.itcavl === "N" || rt <= 5) ? "Excluded" : "Inputs";
         const hsn = rt <= 5 ? "4820" : getActiveCompany().hsnDefault;
@@ -2177,8 +2260,8 @@
       const boenum = String(boe.boenum || "").trim();
       const boedt = String(boe.boedt || "").replace(/\//g, "-").trim();
       const portcd = String(boe.portcode || "").trim();
-      const val = Number(boe.txval) || 0;
-      const iamt = Number(boe.igst) || 0;
+      const val = r2(boe.txval);
+      const iamt = r2(boe.igst);
       const rt = val > 0 ? Math.round((iamt / val) * 100) : 18;
 
       const idx = APP_STATE.inwardInvoices.findIndex(
@@ -2202,13 +2285,13 @@
     (docdata.cdnr || []).forEach(sup => {
       (sup.nt || []).forEach(nt => {
         const sign = String(nt.ntty || "C").toUpperCase() === "C" ? -1 : 1;
-        const cgst = sign * (Number(nt.cgst) || 0);
-        const sgst = sign * (Number(nt.sgst) || 0);
-        const igst = sign * (Number(nt.igst) || 0);
+        const cgst = r2(sign * (Number(nt.cgst) || 0));
+        const sgst = r2(sign * (Number(nt.sgst) || 0));
+        const igst = r2(sign * (Number(nt.igst) || 0));
         APP_STATE.otherTables.inBoECount++;
-        setNumVal("othInCdnCgst", getNumVal("othInCdnCgst") + cgst);
-        setNumVal("othInCdnSgst", getNumVal("othInCdnSgst") + sgst);
-        setNumVal("othInBoEIgst", getNumVal("othInBoEIgst") + igst);
+        setNumVal("othInCdnCgst", r2(getNumVal("othInCdnCgst") + cgst));
+        setNumVal("othInCdnSgst", r2(getNumVal("othInCdnSgst") + sgst));
+        setNumVal("othInBoEIgst", r2(getNumVal("othInBoEIgst") + igst));
         setTextVal("othInBoECount", String(APP_STATE.otherTables.inBoECount));
       });
     });
@@ -2216,7 +2299,7 @@
     logImportMessage(`Parsed GSTR-2B (${sourceName}, Period ${rtnprd}): B2B Suppliers=${(docdata.b2b||[]).length}, Import BOE=${boeList.length}, Inward CDNR=${(docdata.cdnr||[]).length}.`);
   }
 
-  // 12. Parse Monthly Portal GSTR-1 (.json / .csv) with Quote-Aware CSV Parsing (Fixes Audit Bug #5)
+  // 12. Parse Monthly Portal GSTR-1 (.json / .csv) with Quote-Aware CSV Parsing
   function handleGstr1JsonUpload(event) {
     const files = Array.from(event.target.files || []);
     if (!files.length) return;
@@ -2236,16 +2319,16 @@
               const ctin = cols[1];
               const inum = cols[2].length === 1 ? "0" + cols[2] : cols[2];
               const idt = cols[3].replace(/\//g, "-");
-              const invVal = cleanCsvNum(cols[4]);
+              const invVal = r2(cleanCsvNum(cols[4]));
               const rt = parseInt(String(cols[5]).replace("%", ""), 10) || 5;
-              const val = cleanCsvNum(cols[6]);
-              const camt = cleanCsvNum(cols[7]);
-              const samt = cleanCsvNum(cols[8]);
-              const iamt = cleanCsvNum(cols[9]);
+              const val = r2(cleanCsvNum(cols[6]));
+              const camt = r2(cleanCsvNum(cols[7]));
+              const samt = r2(cleanCsvNum(cols[8]));
+              const iamt = r2(cleanCsvNum(cols[9]));
               const isInv = rt <= 12;
 
               const idx = APP_STATE.outwardInvoices.findIndex(x => x.inum === inum && x.idt === idt && x.rt === rt);
-              const rec = { prd, ctin, inum, idt, rt, val, camt, samt, iamt, invVal: invVal || +(val + camt + samt + iamt).toFixed(2), isInv };
+              const rec = { prd, ctin, inum, idt, rt, val, camt, samt, iamt, invVal: invVal || r2(val + camt + samt + iamt), isInv };
               if (idx >= 0) APP_STATE.outwardInvoices[idx] = rec;
               else APP_STATE.outwardInvoices.push(rec);
             }
@@ -2277,24 +2360,24 @@
       (party.inv || []).forEach(inv => {
         const inum = String(inv.inum || "");
         const idt = String(inv.idt || "").replace(/\//g, "-");
-        const invVal = Number(inv.val) || 0;
+        const invVal = r2(inv.val);
         const invTyp = String(inv.inv_typ || "R").toUpperCase();
 
         (inv.itms || []).forEach(itm => {
           const det = itm.itm_det || {};
           const rt = Number(det.rt) || 0;
-          const val = Number(det.txval) || 0;
-          const camt = Number(det.camt) || 0;
-          const samt = Number(det.samt) || 0;
-          const iamt = Number(det.iamt) || 0;
-          b2bTaxSum += (camt + samt + iamt);
+          const val = r2(det.txval);
+          const camt = r2(det.camt);
+          const samt = r2(det.samt);
+          const iamt = r2(det.iamt);
+          b2bTaxSum = r2(b2bTaxSum + camt + samt + iamt);
 
           if (invTyp === "SEWP" || invTyp === "SEWOP" || invTyp === "DE") {
             APP_STATE.otherTables.sezList.push({ prd, ctin, inum, idt, invTyp, rt, val, camt, samt, iamt });
-            setNumVal("othSezVal", getNumVal("othSezVal") + val);
-            setNumVal("othSezCgst", getNumVal("othSezCgst") + camt);
-            setNumVal("othSezSgst", getNumVal("othSezSgst") + samt);
-            setNumVal("othSezIgst", getNumVal("othSezIgst") + iamt);
+            setNumVal("othSezVal", r2(getNumVal("othSezVal") + val));
+            setNumVal("othSezCgst", r2(getNumVal("othSezCgst") + camt));
+            setNumVal("othSezSgst", r2(getNumVal("othSezSgst") + samt));
+            setNumVal("othSezIgst", r2(getNumVal("othSezIgst") + iamt));
             setTextVal("othSezCount", String(APP_STATE.otherTables.sezList.length));
           } else {
             const isInv = rt <= 12;
@@ -2311,8 +2394,8 @@
     const b2cEntries = [];
     (r1.b2cs || []).forEach(item => {
       b2cEntries.push({
-        rt: Number(item.rt) || 0, val: Number(item.txval) || 0,
-        camt: Number(item.camt) || 0, samt: Number(item.samt) || 0, iamt: Number(item.iamt) || 0
+        rt: Number(item.rt) || 0, val: r2(item.txval),
+        camt: r2(item.camt), samt: r2(item.samt), iamt: r2(item.iamt)
       });
     });
     (r1.b2cl || []).forEach(posGroup => {
@@ -2320,8 +2403,8 @@
         (inv.itms || []).forEach(itm => {
           const det = itm.itm_det || {};
           b2cEntries.push({
-            rt: Number(det.rt) || 0, val: Number(det.txval) || 0,
-            camt: Number(det.camt) || 0, samt: Number(det.samt) || 0, iamt: Number(det.iamt) || 0
+            rt: Number(det.rt) || 0, val: r2(det.txval),
+            camt: r2(det.camt), samt: r2(det.samt), iamt: r2(det.iamt)
           });
         });
       });
@@ -2330,17 +2413,17 @@
     b2cEntries.forEach(b => {
       if (b.rt <= 12) {
         APP_STATE.otherTables.b2cInvCount++;
-        setNumVal("othB2cInvVal", getNumVal("othB2cInvVal") + b.val);
-        setNumVal("othB2cInvCgst", getNumVal("othB2cInvCgst") + b.camt);
-        setNumVal("othB2cInvSgst", getNumVal("othB2cInvSgst") + b.samt);
-        setNumVal("othB2cInvIgst", getNumVal("othB2cInvIgst") + b.iamt);
+        setNumVal("othB2cInvVal", r2(getNumVal("othB2cInvVal") + b.val));
+        setNumVal("othB2cInvCgst", r2(getNumVal("othB2cInvCgst") + b.camt));
+        setNumVal("othB2cInvSgst", r2(getNumVal("othB2cInvSgst") + b.samt));
+        setNumVal("othB2cInvIgst", r2(getNumVal("othB2cInvIgst") + b.iamt));
         setTextVal("othB2cInvCount", String(APP_STATE.otherTables.b2cInvCount));
       } else {
         APP_STATE.otherTables.b2cNonCount++;
-        setNumVal("othB2cNonVal", getNumVal("othB2cNonVal") + b.val);
-        setNumVal("othB2cNonCgst", getNumVal("othB2cNonCgst") + b.camt);
-        setNumVal("othB2cNonSgst", getNumVal("othB2cNonSgst") + b.samt);
-        setNumVal("othB2cNonIgst", getNumVal("othB2cNonIgst") + b.iamt);
+        setNumVal("othB2cNonVal", r2(getNumVal("othB2cNonVal") + b.val));
+        setNumVal("othB2cNonCgst", r2(getNumVal("othB2cNonCgst") + b.camt));
+        setNumVal("othB2cNonSgst", r2(getNumVal("othB2cNonSgst") + b.samt));
+        setNumVal("othB2cNonIgst", r2(getNumVal("othB2cNonIgst") + b.iamt));
         setTextVal("othB2cNonCount", String(APP_STATE.otherTables.b2cNonCount));
       }
     });
@@ -2351,17 +2434,17 @@
       (expGrp.inv || []).forEach(inv => {
         let txval = 0, iamt = 0;
         (inv.itms || []).forEach(itm => {
-          txval += Number(itm.txval) || 0;
-          iamt += Number(itm.iamt) || 0;
+          txval = r2(txval + (Number(itm.txval) || 0));
+          iamt = r2(iamt + (Number(itm.iamt) || 0));
         });
         APP_STATE.otherTables.exp6AList.push({
           prd, expTyp, inum: String(inv.inum || ""),
           idt: String(inv.idt || "").replace(/\//g, "-"),
-          val: Number(inv.val) || txval, txval, iamt,
+          val: r2(inv.val || txval), txval, iamt,
           sbpcode: inv.sbpcode || "", sbnum: String(inv.sbnum || ""), sbdt: String(inv.sbdt || "")
         });
-        setNumVal("othExp6AVal", getNumVal("othExp6AVal") + txval);
-        setNumVal("othExp6AIgst", getNumVal("othExp6AIgst") + iamt);
+        setNumVal("othExp6AVal", r2(getNumVal("othExp6AVal") + txval));
+        setNumVal("othExp6AIgst", r2(getNumVal("othExp6AIgst") + iamt));
         setTextVal("othExp6ACount", String(APP_STATE.otherTables.exp6AList.length));
       });
     });
@@ -2373,10 +2456,10 @@
         (nt.itms || []).forEach(itm => {
           const det = itm.itm_det || {};
           APP_STATE.otherTables.outCdnCount++;
-          setNumVal("othOutCdnVal", getNumVal("othOutCdnVal") + sign * (Number(det.txval) || 0));
-          setNumVal("othOutCdnCgst", getNumVal("othOutCdnCgst") + sign * (Number(det.camt) || 0));
-          setNumVal("othOutCdnSgst", getNumVal("othOutCdnSgst") + sign * (Number(det.samt) || 0));
-          setNumVal("othOutCdnIgst", getNumVal("othOutCdnIgst") + sign * (Number(det.iamt) || 0));
+          setNumVal("othOutCdnVal", r2(getNumVal("othOutCdnVal") + sign * (Number(det.txval) || 0)));
+          setNumVal("othOutCdnCgst", r2(getNumVal("othOutCdnCgst") + sign * (Number(det.camt) || 0)));
+          setNumVal("othOutCdnSgst", r2(getNumVal("othOutCdnSgst") + sign * (Number(det.samt) || 0)));
+          setNumVal("othOutCdnIgst", r2(getNumVal("othOutCdnIgst") + sign * (Number(det.iamt) || 0)));
           setTextVal("othOutCdnCount", String(APP_STATE.otherTables.outCdnCount));
         });
       });
@@ -2387,10 +2470,10 @@
     // E. Table 8: Nil-Rated, Exempt & Non-GST Outward Supplies (nil)
     if (r1.nil && Array.isArray(r1.nil.inv)) {
       r1.nil.inv.forEach(n => {
-        const amt = (Number(n.nil_amt) || 0) + (Number(n.expt_amt) || 0) + (Number(n.ngsup_amt) || 0);
+        const amt = r2((Number(n.nil_amt) || 0) + (Number(n.expt_amt) || 0) + (Number(n.ngsup_amt) || 0));
         if (amt > 0) {
           APP_STATE.otherTables.nilCount++;
-          setNumVal("othNilVal", getNumVal("othNilVal") + amt);
+          setNumVal("othNilVal", r2(getNumVal("othNilVal") + amt));
           setTextVal("othNilCount", String(APP_STATE.otherTables.nilCount));
         }
       });
@@ -2398,9 +2481,9 @@
 
     // F. Cross-check HSN Summary vs B2B Tax
     if (r1.hsn && Array.isArray(r1.hsn.hsn_b2b)) {
-      const hsnTaxSum = r1.hsn.hsn_b2b.reduce(
+      const hsnTaxSum = r2(r1.hsn.hsn_b2b.reduce(
         (acc, h) => acc + (Number(h.camt) || 0) + (Number(h.samt) || 0) + (Number(h.iamt) || 0), 0
-      );
+      ));
       if (Math.abs(b2bTaxSum - hsnTaxSum) > 1) {
         const msg = `Period ${prd} (${sourceName}): B2B Invoice Tax is ₹${b2bTaxSum.toFixed(2)} but HSN Summary Tax is ₹${hsnTaxSum.toFixed(2)} (Diff: ₹${(b2bTaxSum - hsnTaxSum).toFixed(2)}).`;
         if (!APP_STATE.hsnAuditAlerts.includes(msg)) APP_STATE.hsnAuditAlerts.push(msg);
@@ -2448,7 +2531,7 @@
 
         const outMatch = fullText.match(/exempted\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})/i);
         const itcMatch = fullText.match(/\(5\)\s*All other ITC\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})/i);
-        const parseNum = s => parseFloat(String(s || "0").replace(/,/g, "")) || 0;
+        const parseNum = s => r2(parseFloat(String(s || "0").replace(/,/g, "")) || 0);
 
         APP_STATE.gstr3bByMonth[prd] = {
           arn: (fullText.match(/ARN\s+([A-Z0-9]{15})/i) || [,"FILED"])[1],
@@ -2492,22 +2575,22 @@
               const refNo = t.ref_no || t.refNo || t.arn || "";
               const trType = String(t.tr_typ || t.type || "").toUpperCase().startsWith("D") ? "Debit" : "Credit";
 
-              const txIgst = cleanCsvNum(t.igst?.tot ?? t.igstAmt ?? t.tx_igst);
-              const txCgst = cleanCsvNum(t.cgst?.tot ?? t.cgstAmt ?? t.tx_cgst);
-              const txSgst = cleanCsvNum(t.sgst?.tot ?? t.sgstAmt ?? t.tx_sgst);
-              const txCess = cleanCsvNum(t.cess?.tot ?? t.cessAmt ?? t.tx_cess);
+              const txIgst = r2(cleanCsvNum(t.igst?.tot ?? t.igstAmt ?? t.tx_igst));
+              const txCgst = r2(cleanCsvNum(t.cgst?.tot ?? t.cgstAmt ?? t.tx_cgst));
+              const txSgst = r2(cleanCsvNum(t.sgst?.tot ?? t.sgstAmt ?? t.tx_sgst));
+              const txCess = r2(cleanCsvNum(t.cess?.tot ?? t.cessAmt ?? t.tx_cess));
 
-              const balIgst = cleanCsvNum(t.bal_igst?.tot ?? t.balIgst ?? t.igst_bal);
-              const balCgst = cleanCsvNum(t.bal_cgst?.tot ?? t.balCgst ?? t.cgst_bal);
-              const balSgst = cleanCsvNum(t.bal_sgst?.tot ?? t.balSgst ?? t.sgst_bal);
-              const balCess = cleanCsvNum(t.bal_cess?.tot ?? t.balCess ?? t.cess_bal);
+              const balIgst = r2(cleanCsvNum(t.bal_igst?.tot ?? t.balIgst ?? t.igst_bal));
+              const balCgst = r2(cleanCsvNum(t.bal_cgst?.tot ?? t.balCgst ?? t.cgst_bal));
+              const balSgst = r2(cleanCsvNum(t.bal_sgst?.tot ?? t.balSgst ?? t.sgst_bal));
+              const balCess = r2(cleanCsvNum(t.bal_cess?.tot ?? t.balCess ?? t.cess_bal));
 
               entries.push({
                 dt, prd, refNo, desc, trType,
                 txIgst, txCgst, txSgst, txCess,
-                txTotal: +(txIgst + txCgst + txSgst + txCess).toFixed(2),
+                txTotal: r2(txIgst + txCgst + txSgst + txCess),
                 balIgst, balCgst, balSgst, balCess,
-                balTotal: +(balIgst + balCgst + balSgst + balCess).toFixed(2)
+                balTotal: r2(balIgst + balCgst + balSgst + balCess)
               });
             });
           } else {
@@ -2557,7 +2640,7 @@
               const rawType = typeIdx >= 0 ? cols[typeIdx] : (cols[5] || "");
               const trType = /dr|debit/i.test(rawType) ? "Debit" : (/cr|credit/i.test(rawType) ? "Credit" : "Balance");
 
-              const tailNums = cols.slice(Math.max(typeIdx + 1, cols.length - 10)).map(cleanCsvNum);
+              const tailNums = cols.slice(Math.max(typeIdx + 1, cols.length - 10)).map(v => r2(cleanCsvNum(v)));
               let txIgst = 0, txCgst = 0, txSgst = 0, txCess = 0, txTotal = 0;
               let balIgst = 0, balCgst = 0, balSgst = 0, balCess = 0, balTotal = 0;
 
@@ -2565,11 +2648,11 @@
                 [txIgst, txCgst, txSgst, txCess, txTotal, balIgst, balCgst, balSgst, balCess, balTotal] = tailNums.slice(-10);
               } else if (tailNums.length === 8) {
                 [txIgst, txCgst, txSgst, txCess, balIgst, balCgst, balSgst, balCess] = tailNums;
-                txTotal = +(txIgst + txCgst + txSgst + txCess).toFixed(2);
-                balTotal = +(balIgst + balCgst + balSgst + balCess).toFixed(2);
+                txTotal = r2(txIgst + txCgst + txSgst + txCess);
+                balTotal = r2(balIgst + balCgst + balSgst + balCess);
               } else if (tailNums.length >= 4) {
                 [balIgst, balCgst, balSgst, balCess] = tailNums.slice(-4);
-                balTotal = +(balIgst + balCgst + balSgst + balCess).toFixed(2);
+                balTotal = r2(balIgst + balCgst + balSgst + balCess);
               }
 
               entries.push({
@@ -2885,7 +2968,7 @@
           );
           if (stmtKey && Array.isArray(json[stmtKey])) {
             if (json.version) APP_STATE.schemaConfig.stmt1AVersion = String(json.version);
-            APP_STATE.schemaConfig.stmt1AKey = stmtKey;
+            if (/^stmt01A$/i.test(stmtKey)) APP_STATE.schemaConfig.stmt1AKey = stmtKey;
             saveSchemaSettings();
             const fakeEvt = { target: { files: [new File([JSON.stringify(json)], file.name, { type: "application/json" })] } };
             handleStmt1AUpload(fakeEvt);
@@ -2902,9 +2985,9 @@
             APP_STATE.schemaConfig.annexBKey = annexKey;
             saveSchemaSettings();
             if (json.revCGST || json.revSGST || json.revIGST) {
-              setNumVal("othInCdnCgst", -Math.abs(Number(json.revCGST) || 0));
-              setNumVal("othInCdnSgst", -Math.abs(Number(json.revSGST) || 0));
-              setNumVal("othInBoEIgst", -Math.abs(Number(json.revIGST) || 0));
+              setNumVal("othInCdnCgst", -Math.abs(r2(json.revCGST)));
+              setNumVal("othInCdnSgst", -Math.abs(r2(json.revSGST)));
+              setNumVal("othInBoEIgst", -Math.abs(r2(json.revIGST)));
             }
             const fakeEvt = { target: { files: [new File([JSON.stringify(json)], file.name, { type: "application/json" })] } };
             handleAnnexBUpload(fakeEvt);
@@ -2943,6 +3026,8 @@
      PART 3 OF 3: UNIFIED CALCULATOR, PERIOD-FILTERED TABLES, 7-TABLE CSV
      EXPORTER, PRINTABLE DOCS 1/2/4, BACKUP/RESTORE & CLEAN BOOT
      ===================================================================== */
+
+  const DOC_HTML_STORAGE_PREFIX = "PEAK_RFD01_DOC_HTML_";
 
   // Helper: Format number in Indian Rupee format (e.g., 4,34,750.10)
   function fmtINR(num) {
@@ -2991,6 +3076,53 @@
     return list;
   }
 
+  // Persist manual contenteditable changes per company in localStorage
+  function markDocEdited(docKey) {
+    if (!APP_STATE.docEdited || !docKey) return;
+    APP_STATE.docEdited[docKey] = true;
+    saveCustomDocHtmlState();
+  }
+
+  function saveCustomDocHtmlState() {
+    if (_isRestoringCompanyState) return;
+    try {
+      const compId = APP_STATE.activeCompanyId || "NOORA_DEFAULT";
+      const payload = {
+        docEdited: APP_STATE.docEdited,
+        doc1: APP_STATE.docEdited.doc1 ? (document.getElementById("sheet-doc1")?.innerHTML || "") : "",
+        doc2: APP_STATE.docEdited.doc2 ? (document.getElementById("sheet-doc2")?.innerHTML || "") : "",
+        doc4: APP_STATE.docEdited.doc4 ? (document.getElementById("sheet-doc4")?.innerHTML || "") : ""
+      };
+      localStorage.setItem(DOC_HTML_STORAGE_PREFIX + compId, JSON.stringify(payload));
+    } catch (e) {}
+  }
+
+  function clearCustomDocHtmlState() {
+    try {
+      const compId = APP_STATE.activeCompanyId || "NOORA_DEFAULT";
+      localStorage.removeItem(DOC_HTML_STORAGE_PREFIX + compId);
+    } catch (e) {}
+  }
+
+  function restoreCustomDocHtmlIfEdited() {
+    try {
+      const compId = APP_STATE.activeCompanyId || "NOORA_DEFAULT";
+      const raw = localStorage.getItem(DOC_HTML_STORAGE_PREFIX + compId);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (!saved || !saved.docEdited) return;
+      ["doc1", "doc2", "doc4"].forEach(k => {
+        if (saved.docEdited[k] && saved[k]) {
+          const el = document.getElementById("sheet-" + k);
+          if (el) {
+            el.innerHTML = saved[k];
+            APP_STATE.docEdited[k] = true;
+          }
+        }
+      });
+    } catch (e) {}
+  }
+
   // Navigation Tab Switcher
   function switchTab(tabId, btnEl) {
     document.querySelectorAll(".tab-pane").forEach(el => el.classList.remove("active"));
@@ -3003,6 +3135,7 @@
   function onRefundTypeChange() {
     APP_STATE.refundType = document.getElementById("refundTypeSelect").value;
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     if (APP_STATE.creditLedgerEntries.length || APP_STATE.cashLedgerEntries.length) {
       syncLedgerBalancesByPeriod(false);
     }
@@ -3013,6 +3146,7 @@
     APP_STATE.fromPeriod = document.getElementById("fromPeriodInput").value;
     APP_STATE.toPeriod = document.getElementById("toPeriodInput").value;
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     if (APP_STATE.creditLedgerEntries.length || APP_STATE.cashLedgerEntries.length) {
       syncLedgerBalancesByPeriod(false);
     }
@@ -3030,45 +3164,45 @@
     const maxPrd = yyyymmToInt(APP_STATE.toPeriod);
 
     // 1. Read Other GSTR-1 & GSTR-2B Table Inputs (Card 5)
-    const b2cInvVal = getNumVal("othB2cInvVal");
-    const b2cInvCgst = getNumVal("othB2cInvCgst");
-    const b2cInvSgst = getNumVal("othB2cInvSgst");
-    const b2cInvIgst = getNumVal("othB2cInvIgst");
-    const b2cInvTax = +(b2cInvCgst + b2cInvSgst + b2cInvIgst).toFixed(2);
+    const b2cInvVal = r2(getNumVal("othB2cInvVal"));
+    const b2cInvCgst = r2(getNumVal("othB2cInvCgst"));
+    const b2cInvSgst = r2(getNumVal("othB2cInvSgst"));
+    const b2cInvIgst = r2(getNumVal("othB2cInvIgst"));
+    const b2cInvTax = r2(b2cInvCgst + b2cInvSgst + b2cInvIgst);
     setTextVal("othB2cInvTotTax", fmtINR(b2cInvTax));
 
-    const b2cNonVal = getNumVal("othB2cNonVal");
-    const b2cNonCgst = getNumVal("othB2cNonCgst");
-    const b2cNonSgst = getNumVal("othB2cNonSgst");
-    const b2cNonIgst = getNumVal("othB2cNonIgst");
-    const b2cNonTax = +(b2cNonCgst + b2cNonSgst + b2cNonIgst).toFixed(2);
+    const b2cNonVal = r2(getNumVal("othB2cNonVal"));
+    const b2cNonCgst = r2(getNumVal("othB2cNonCgst"));
+    const b2cNonSgst = r2(getNumVal("othB2cNonSgst"));
+    const b2cNonIgst = r2(getNumVal("othB2cNonIgst"));
+    const b2cNonTax = r2(b2cNonCgst + b2cNonSgst + b2cNonIgst);
     setTextVal("othB2cNonTotTax", fmtINR(b2cNonTax));
 
-    const exp6AVal = getNumVal("othExp6AVal");
-    const exp6AIgst = getNumVal("othExp6AIgst");
+    const exp6AVal = r2(getNumVal("othExp6AVal"));
+    const exp6AIgst = r2(getNumVal("othExp6AIgst"));
     setTextVal("othExp6ATotTax", fmtINR(exp6AIgst));
 
-    const sezVal = getNumVal("othSezVal");
-    const sezCgst = getNumVal("othSezCgst");
-    const sezSgst = getNumVal("othSezSgst");
-    const sezIgst = getNumVal("othSezIgst");
-    const sezTax = +(sezCgst + sezSgst + sezIgst).toFixed(2);
+    const sezVal = r2(getNumVal("othSezVal"));
+    const sezCgst = r2(getNumVal("othSezCgst"));
+    const sezSgst = r2(getNumVal("othSezSgst"));
+    const sezIgst = r2(getNumVal("othSezIgst"));
+    const sezTax = r2(sezCgst + sezSgst + sezIgst);
     setTextVal("othSezTotTax", fmtINR(sezTax));
 
-    const outCdnVal = getNumVal("othOutCdnVal");
-    const outCdnCgst = getNumVal("othOutCdnCgst");
-    const outCdnSgst = getNumVal("othOutCdnSgst");
-    const outCdnIgst = getNumVal("othOutCdnIgst");
-    const outCdnTax = +(outCdnCgst + outCdnSgst + outCdnIgst).toFixed(2);
+    const outCdnVal = r2(getNumVal("othOutCdnVal"));
+    const outCdnCgst = r2(getNumVal("othOutCdnCgst"));
+    const outCdnSgst = r2(getNumVal("othOutCdnSgst"));
+    const outCdnIgst = r2(getNumVal("othOutCdnIgst"));
+    const outCdnTax = r2(outCdnCgst + outCdnSgst + outCdnIgst);
     setTextVal("othOutCdnTotTax", fmtINR(outCdnTax));
 
-    const nilOutVal = getNumVal("othNilVal");
+    const nilOutVal = r2(getNumVal("othNilVal"));
 
-    const inBoEVal = getNumVal("othInBoEVal");
-    const inCdnCgst = getNumVal("othInCdnCgst");
-    const inCdnSgst = getNumVal("othInCdnSgst");
-    const inBoEIgst = getNumVal("othInBoEIgst");
-    const inOthTotItc = +(inCdnCgst + inCdnSgst + inBoEIgst).toFixed(2);
+    const inBoEVal = r2(getNumVal("othInBoEVal"));
+    const inCdnCgst = r2(getNumVal("othInCdnCgst"));
+    const inCdnSgst = r2(getNumVal("othInCdnSgst"));
+    const inBoEIgst = r2(getNumVal("othInBoEIgst"));
+    const inOthTotItc = r2(inCdnCgst + inCdnSgst + inBoEIgst);
     setTextVal("othInBoETotItc", fmtINR(inOthTotItc));
 
     // 2. Filter inward & outward invoices within selected period
@@ -3091,185 +3225,208 @@
     let elg18Taxable = 0, elg18Total = 0, elg18Count = 0;
 
     inFiltered.forEach(inv => {
-      const val = Number(inv.val) || 0;
-      const c = Number(inv.camt) || 0;
-      const s = Number(inv.samt) || 0;
-      const i = Number(inv.iamt) || 0;
-      const tot = +(c + s + i).toFixed(2);
+      const val = r2(inv.val);
+      const c = r2(inv.camt);
+      const s = r2(inv.samt);
+      const i = r2(inv.iamt);
+      const tot = r2(c + s + i);
 
-      gross2BTaxable += val;
-      gross2BCgst += c;
-      gross2BSgst += s;
-      gross2BIgst += i;
-      gross2BTotal += tot;
+      gross2BTaxable = r2(gross2BTaxable + val);
+      gross2BCgst = r2(gross2BCgst + c);
+      gross2BSgst = r2(gross2BSgst + s);
+      gross2BIgst = r2(gross2BIgst + i);
+      gross2BTotal = r2(gross2BTotal + tot);
 
       if (inv.cat === "Inputs") {
         elgCount++;
-        elgTaxable += val;
-        elgCgst += c;
-        elgSgst += s;
-        elgIgst += i;
-        elgTotal += tot;
-        if (Number(inv.rt) === 12) { elg12Count++; elg12Taxable += val; elg12Total += tot; }
-        else { elg18Count++; elg18Taxable += val; elg18Total += tot; }
+        elgTaxable = r2(elgTaxable + val);
+        elgCgst = r2(elgCgst + c);
+        elgSgst = r2(elgSgst + s);
+        elgIgst = r2(elgIgst + i);
+        elgTotal = r2(elgTotal + tot);
+        if (Number(inv.rt) === 12) {
+          elg12Count++;
+          elg12Taxable = r2(elg12Taxable + val);
+          elg12Total = r2(elg12Total + tot);
+        } else {
+          elg18Count++;
+          elg18Taxable = r2(elg18Taxable + val);
+          elg18Total = r2(elg18Total + tot);
+        }
       } else if (inv.cat === "Input Services" || inv.cat === "Capital Goods") {
         servCapCount++;
-        servCapTaxable += val;
-        servCapCgst += c;
-        servCapSgst += s;
-        servCapIgst += i;
-        servCapTotal += tot;
-        if (inv.cat === "Input Services") inputServicesOnlyItc += tot;
+        servCapTaxable = r2(servCapTaxable + val);
+        servCapCgst = r2(servCapCgst + c);
+        servCapSgst = r2(servCapSgst + s);
+        servCapIgst = r2(servCapIgst + i);
+        servCapTotal = r2(servCapTotal + tot);
+        if (inv.cat === "Input Services") inputServicesOnlyItc = r2(inputServicesOnlyItc + tot);
       } else {
         excl5Count++;
-        excl5Taxable += val;
-        excl5Cgst += c;
-        excl5Sgst += s;
-        excl5Igst += i;
-        excl5Total += tot;
+        excl5Taxable = r2(excl5Taxable + val);
+        excl5Cgst = r2(excl5Cgst + c);
+        excl5Sgst = r2(excl5Sgst + s);
+        excl5Igst = r2(excl5Igst + i);
+        excl5Total = r2(excl5Total + tot);
       }
     });
 
     // Layer Inward Credit/Debit Notes & Manual BOE Adjustments (Card 5 Row 7)
     if (inBoEVal !== 0 || inCdnCgst !== 0 || inCdnSgst !== 0 || inBoEIgst !== 0) {
-      gross2BTaxable = +(gross2BTaxable + inBoEVal).toFixed(2);
-      gross2BCgst = +(gross2BCgst + inCdnCgst).toFixed(2);
-      gross2BSgst = +(gross2BSgst + inCdnSgst).toFixed(2);
-      gross2BIgst = +(gross2BIgst + inBoEIgst).toFixed(2);
-      gross2BTotal = +(gross2BCgst + gross2BSgst + gross2BIgst).toFixed(2);
+      gross2BTaxable = r2(gross2BTaxable + inBoEVal);
+      gross2BCgst = r2(gross2BCgst + inCdnCgst);
+      gross2BSgst = r2(gross2BSgst + inCdnSgst);
+      gross2BIgst = r2(gross2BIgst + inBoEIgst);
+      gross2BTotal = r2(gross2BCgst + gross2BSgst + gross2BIgst);
 
-      elgTaxable = +(elgTaxable + inBoEVal).toFixed(2);
-      elgCgst = +(elgCgst + inCdnCgst).toFixed(2);
-      elgSgst = +(elgSgst + inCdnSgst).toFixed(2);
-      elgIgst = +(elgIgst + inBoEIgst).toFixed(2);
-      elgTotal = +(elgCgst + elgSgst + elgIgst).toFixed(2);
+      elgTaxable = r2(elgTaxable + inBoEVal);
+      elgCgst = r2(elgCgst + inCdnCgst);
+      elgSgst = r2(elgSgst + inCdnSgst);
+      elgIgst = r2(elgIgst + inBoEIgst);
+      elgTotal = r2(elgCgst + elgSgst + elgIgst);
     }
 
-    const manualExtraServ = getNumVal("extraInputServicesInput");
+    const manualExtraServ = r2(getNumVal("extraInputServicesInput"));
     if (manualExtraServ > 0) {
-      servCapTotal = +(servCapTotal + manualExtraServ).toFixed(2);
-      inputServicesOnlyItc = +(inputServicesOnlyItc + manualExtraServ).toFixed(2);
+      servCapTotal = r2(servCapTotal + manualExtraServ);
+      inputServicesOnlyItc = r2(inputServicesOnlyItc + manualExtraServ);
     }
 
-    // 4. Outward Aggregations
+    // 4. Outward Aggregations (Now tracking out12Igst & out5Igst for Inter-State accuracy)
     let invTurnTaxable = 0, invOutCgst = 0, invOutSgst = 0, invOutIgst = 0, invOutTotalTax = 0, invOutGrossVal = 0, invOutCount = 0;
-    let out12Taxable = 0, out12Cgst = 0, out12Sgst = 0, out12TotalTax = 0, out12GrossVal = 0, out12Count = 0;
-    let out5Taxable = 0, out5Cgst = 0, out5Sgst = 0, out5TotalTax = 0, out5GrossVal = 0, out5Count = 0;
+    let out12Taxable = 0, out12Cgst = 0, out12Sgst = 0, out12Igst = 0, out12TotalTax = 0, out12GrossVal = 0, out12Count = 0;
+    let out5Taxable = 0, out5Cgst = 0, out5Sgst = 0, out5Igst = 0, out5TotalTax = 0, out5GrossVal = 0, out5Count = 0;
     let nonInvTurnTaxable = 0, nonInvCgst = 0, nonInvSgst = 0, nonInvIgst = 0, nonInvTotalTax = 0, nonInvGrossVal = 0, nonInvCount = 0;
 
     outFiltered.forEach(out => {
-      const val = Number(out.val) || 0;
-      const c = Number(out.camt) || 0;
-      const s = Number(out.samt) || 0;
-      const i = Number(out.iamt) || 0;
-      const tot = +(c + s + i).toFixed(2);
-      const gVal = Number(out.invVal) || +(val + tot).toFixed(2);
+      const val = r2(out.val);
+      const c = r2(out.camt);
+      const s = r2(out.samt);
+      const i = r2(out.iamt);
+      const tot = r2(c + s + i);
+      const gVal = r2(Number(out.invVal) || (val + tot));
 
       if (out.isInv) {
         invOutCount++;
-        invTurnTaxable += val;
-        invOutCgst += c;
-        invOutSgst += s;
-        invOutIgst += i;
-        invOutTotalTax += tot;
-        invOutGrossVal += gVal;
+        invTurnTaxable = r2(invTurnTaxable + val);
+        invOutCgst = r2(invOutCgst + c);
+        invOutSgst = r2(invOutSgst + s);
+        invOutIgst = r2(invOutIgst + i);
+        invOutTotalTax = r2(invOutTotalTax + tot);
+        invOutGrossVal = r2(invOutGrossVal + gVal);
         if (Number(out.rt) === 12) {
-          out12Count++; out12Taxable += val; out12Cgst += c; out12Sgst += s; out12TotalTax += tot; out12GrossVal += gVal;
+          out12Count++;
+          out12Taxable = r2(out12Taxable + val);
+          out12Cgst = r2(out12Cgst + c);
+          out12Sgst = r2(out12Sgst + s);
+          out12Igst = r2(out12Igst + i);
+          out12TotalTax = r2(out12TotalTax + tot);
+          out12GrossVal = r2(out12GrossVal + gVal);
         } else {
-          out5Count++; out5Taxable += val; out5Cgst += c; out5Sgst += s; out5TotalTax += tot; out5GrossVal += gVal;
+          out5Count++;
+          out5Taxable = r2(out5Taxable + val);
+          out5Cgst = r2(out5Cgst + c);
+          out5Sgst = r2(out5Sgst + s);
+          out5Igst = r2(out5Igst + i);
+          out5TotalTax = r2(out5TotalTax + tot);
+          out5GrossVal = r2(out5GrossVal + gVal);
         }
       } else {
         nonInvCount++;
-        nonInvTurnTaxable += val;
-        nonInvCgst += c;
-        nonInvSgst += s;
-        nonInvIgst += i;
-        nonInvTotalTax += tot;
-        nonInvGrossVal += gVal;
+        nonInvTurnTaxable = r2(nonInvTurnTaxable + val);
+        nonInvCgst = r2(nonInvCgst + c);
+        nonInvSgst = r2(nonInvSgst + s);
+        nonInvIgst = r2(nonInvIgst + i);
+        nonInvTotalTax = r2(nonInvTotalTax + tot);
+        nonInvGrossVal = r2(nonInvGrossVal + gVal);
       }
     });
 
     // Layer Other Outward GSTR-1 Tables (B2CS/B2CL, Export 6A, SEZ/DE, Outward Credit/Debit Notes)
-    invTurnTaxable = +(invTurnTaxable + b2cInvVal + exp6AVal + sezVal + outCdnVal).toFixed(2);
-    invOutCgst = +(invOutCgst + b2cInvCgst + sezCgst + outCdnCgst).toFixed(2);
-    invOutSgst = +(invOutSgst + b2cInvSgst + sezSgst + outCdnSgst).toFixed(2);
-    invOutIgst = +(invOutIgst + b2cInvIgst + exp6AIgst + sezIgst + outCdnIgst).toFixed(2);
-    invOutTotalTax = +(invOutCgst + invOutSgst + invOutIgst).toFixed(2);
-    invOutGrossVal = +(invOutGrossVal + b2cInvVal + b2cInvTax + exp6AVal + exp6AIgst + sezVal + sezTax + outCdnVal + outCdnTax).toFixed(2);
+    invTurnTaxable = r2(invTurnTaxable + b2cInvVal + exp6AVal + sezVal + outCdnVal);
+    invOutCgst = r2(invOutCgst + b2cInvCgst + sezCgst + outCdnCgst);
+    invOutSgst = r2(invOutSgst + b2cInvSgst + sezSgst + outCdnSgst);
+    invOutIgst = r2(invOutIgst + b2cInvIgst + exp6AIgst + sezIgst + outCdnIgst);
+    invOutTotalTax = r2(invOutCgst + invOutSgst + invOutIgst);
+    invOutGrossVal = r2(invOutGrossVal + b2cInvVal + b2cInvTax + exp6AVal + exp6AIgst + sezVal + sezTax + outCdnVal + outCdnTax);
 
-    nonInvTurnTaxable = +(nonInvTurnTaxable + b2cNonVal).toFixed(2);
-    nonInvCgst = +(nonInvCgst + b2cNonCgst).toFixed(2);
-    nonInvSgst = +(nonInvSgst + b2cNonSgst).toFixed(2);
-    nonInvIgst = +(nonInvIgst + b2cNonIgst).toFixed(2);
-    nonInvTotalTax = +(nonInvCgst + nonInvSgst + nonInvIgst).toFixed(2);
-    nonInvGrossVal = +(nonInvGrossVal + b2cNonVal + b2cNonTax).toFixed(2);
+    nonInvTurnTaxable = r2(nonInvTurnTaxable + b2cNonVal);
+    nonInvCgst = r2(nonInvCgst + b2cNonCgst);
+    nonInvSgst = r2(nonInvSgst + b2cNonSgst);
+    nonInvIgst = r2(nonInvIgst + b2cNonIgst);
+    nonInvTotalTax = r2(nonInvCgst + nonInvSgst + nonInvIgst);
+    nonInvGrossVal = r2(nonInvGrossVal + b2cNonVal + b2cNonTax);
 
-    const extraB2C = getNumVal("extraB2CTurnoverInput");
-    const adjTotalTurnover = +(invTurnTaxable + nonInvTurnTaxable + extraB2C).toFixed(2);
-    const totalOutTaxAll = +(invOutTotalTax + nonInvTotalTax).toFixed(2);
-    const totalOutGrossValAll = +(invOutGrossVal + nonInvGrossVal).toFixed(2);
+    const extraB2C = r2(getNumVal("extraB2CTurnoverInput"));
+    const adjTotalTurnover = r2(invTurnTaxable + nonInvTurnTaxable + extraB2C);
+    const totalOutTaxAll = r2(invOutTotalTax + nonInvTotalTax);
+    const totalOutGrossValAll = r2(invOutGrossVal + nonInvGrossVal);
 
     // 5. Table-1 Formula Calculation (Exact Notification No. 14/2022-CT Denominator)
     const col2Mode = document.getElementById("col2TaxModeSelect")?.value || "PORTAL_GROSS";
-    const denomInputsAndServices = +(elgTotal + inputServicesOnlyItc).toFixed(2);
+    const denomInputsAndServices = r2(elgTotal + inputServicesOnlyItc);
     const propTaxPayable = denomInputsAndServices > 0
-      ? +(invOutTotalTax * (elgTotal / denomInputsAndServices)).toFixed(2)
-      : +invOutTotalTax.toFixed(2);
+      ? r2(invOutTotalTax * (elgTotal / denomInputsAndServices))
+      : r2(invOutTotalTax);
 
-    let col1 = +invTurnTaxable.toFixed(2);
-    let col2 = col2Mode === "RULE89_PROP" ? propTaxPayable : +invOutTotalTax.toFixed(2);
+    let col1 = r2(invTurnTaxable);
+    let col2 = col2Mode === "RULE89_PROP" ? propTaxPayable : r2(invOutTotalTax);
     let col3 = adjTotalTurnover > 0 ? adjTotalTurnover : col1;
-    let col4 = +elgTotal.toFixed(2);
+    let col4 = r2(elgTotal);
     let formulaMaxRefund = 0;
 
     if (APP_STATE.refundType === "INVITC") {
-      formulaMaxRefund = col3 > 0 ? +(((col1 * col4) / col3) - col2).toFixed(2) : 0;
+      formulaMaxRefund = col3 > 0 ? r2(((col1 * col4) / col3) - col2) : 0;
     } else if (APP_STATE.refundType === "EXPWOP" || APP_STATE.refundType === "SEZWOP") {
       col2 = 0;
-      formulaMaxRefund = col3 > 0 ? +((col1 * col4) / col3).toFixed(2) : 0;
+      formulaMaxRefund = col3 > 0 ? r2((col1 * col4) / col3) : 0;
     } else if (APP_STATE.refundType === "EXPWP" || APP_STATE.refundType === "SEZWP" || APP_STATE.refundType === "TAXWRG" || APP_STATE.refundType === "DEEMED") {
-      formulaMaxRefund = +invOutTotalTax.toFixed(2);
+      formulaMaxRefund = r2(invOutTotalTax);
     } else if (APP_STATE.refundType === "EXCESS") {
-      formulaMaxRefund = +(getNumVal("ledEndIgst") + getNumVal("ledEndCgst") + getNumVal("ledEndSgst")).toFixed(2);
+      formulaMaxRefund = r2(getNumVal("ledEndIgst") + getNumVal("ledEndCgst") + getNumVal("ledEndSgst"));
     }
     if (formulaMaxRefund < 0) formulaMaxRefund = 0;
 
     // 6. Electronic Credit / Cash Ledger Balance Cap & Head-Wise Debit (Circular 125/44/2019-GST)
-    const ledEndIgst = getNumVal("ledEndIgst");
-    const ledEndCgst = getNumVal("ledEndCgst");
-    const ledEndSgst = getNumVal("ledEndSgst");
-    const ledEndTotal = +(ledEndIgst + ledEndCgst + ledEndSgst).toFixed(2);
+    const ledEndIgst = r2(getNumVal("ledEndIgst"));
+    const ledEndCgst = r2(getNumVal("ledEndCgst"));
+    const ledEndSgst = r2(getNumVal("ledEndSgst"));
+    const ledEndTotal = r2(ledEndIgst + ledEndCgst + ledEndSgst);
 
-    const ledFileIgst = getNumVal("ledFileIgst");
-    const ledFileCgst = getNumVal("ledFileCgst");
-    const ledFileSgst = getNumVal("ledFileSgst");
-    const ledFileTotal = +(ledFileIgst + ledFileCgst + ledFileSgst).toFixed(2);
+    const ledFileIgst = r2(getNumVal("ledFileIgst"));
+    const ledFileCgst = r2(getNumVal("ledFileCgst"));
+    const ledFileSgst = r2(getNumVal("ledFileSgst"));
+    const ledFileTotal = r2(ledFileIgst + ledFileCgst + ledFileSgst);
 
-    const finalEligibleRefund = +Math.min(formulaMaxRefund, ledEndTotal, ledFileTotal).toFixed(2);
+    const finalEligibleRefund = r2(Math.min(formulaMaxRefund, ledEndTotal, ledFileTotal));
 
     const availIgst = Math.min(ledEndIgst, ledFileIgst);
     const availCgst = Math.min(ledEndCgst, ledFileCgst);
     const availSgst = Math.min(ledEndSgst, ledFileSgst);
 
-    const finalIgst = +Math.min(finalEligibleRefund, availIgst).toFixed(2);
-    const remAfterIgst = +(finalEligibleRefund - finalIgst).toFixed(2);
-    let finalCgst = +Math.min(+(remAfterIgst / 2).toFixed(2), availCgst).toFixed(2);
-    let finalSgst = +Math.min(+(remAfterIgst - finalCgst).toFixed(2), availSgst).toFixed(2);
+    const finalIgst = r2(Math.min(finalEligibleRefund, availIgst));
+    const remAfterIgst = r2(finalEligibleRefund - finalIgst);
+    let finalCgst = r2(Math.min(r2(remAfterIgst / 2), availCgst));
+    let finalSgst = r2(Math.min(r2(remAfterIgst - finalCgst), availSgst));
 
-    if (+(finalCgst + finalSgst).toFixed(2) < remAfterIgst) {
-      let shortfall = +(remAfterIgst - (finalCgst + finalSgst)).toFixed(2);
-      const addC = Math.min(shortfall, +(availCgst - finalCgst).toFixed(2));
-      finalCgst = +(finalCgst + addC).toFixed(2);
-      shortfall = +(shortfall - addC).toFixed(2);
-      const addS = Math.min(shortfall, +(availSgst - finalSgst).toFixed(2));
-      finalSgst = +(finalSgst + addS).toFixed(2);
+    if (r2(finalCgst + finalSgst) < remAfterIgst) {
+      let shortfall = r2(remAfterIgst - (finalCgst + finalSgst));
+      const addC = Math.min(shortfall, r2(availCgst - finalCgst));
+      finalCgst = r2(finalCgst + addC);
+      shortfall = r2(shortfall - addC);
+      const addS = Math.min(shortfall, r2(availSgst - finalSgst));
+      finalSgst = r2(finalSgst + addS);
     }
 
-    // 7. 2-Year Statutory Deadline Calculation under Section 54(1)
+    // 7. 2-Year Statutory Deadline Calculation & Live Validation under Section 54(1)
     const [toY, toM] = APP_STATE.toPeriod.split("-").map(Number);
     let dueM = (toM || 3) + 1, dueY = (toY || 2026) + 2;
     if (dueM > 12) { dueM = 1; dueY++; }
     const deadlineStr = `20-${String(dueM).padStart(2, "0")}-${dueY}`;
+    const appDateStr = document.getElementById("appDateInput")?.value || "21-10-2026";
+    const appDateInt = dateStrToInt(appDateStr);
+    const deadlineInt = dateStrToInt(deadlineStr);
+    const isWithinLimitation = (appDateInt === 0 || appDateInt <= deadlineInt);
 
     // Store all calculated metrics in APP_STATE.calc
     APP_STATE.calc = {
@@ -3281,14 +3438,15 @@
       elgTaxable, elgCgst, elgSgst, elgIgst, elgTotal, elgCount,
       elg12Taxable, elg12Total, elg12Count, elg18Taxable, elg18Total, elg18Count,
       invTurnTaxable, invOutCgst, invOutSgst, invOutIgst, invOutTotalTax, invOutGrossVal, invOutCount,
-      out12Taxable, out12Cgst, out12Sgst, out12TotalTax, out12GrossVal, out12Count,
-      out5Taxable, out5Cgst, out5Sgst, out5TotalTax, out5GrossVal, out5Count,
+      out12Taxable, out12Cgst, out12Sgst, out12Igst, out12TotalTax, out12GrossVal, out12Count,
+      out5Taxable, out5Cgst, out5Sgst, out5Igst, out5TotalTax, out5GrossVal, out5Count,
       nonInvTurnTaxable, nonInvCgst, nonInvSgst, nonInvIgst, nonInvTotalTax, nonInvGrossVal, nonInvCount,
       nilOutVal, adjTotalTurnover, totalOutTaxAll, totalOutGrossValAll,
       col1, col2, col3, col4, propTaxPayable, formulaMaxRefund,
       ledEndIgst, ledEndCgst, ledEndSgst, ledEndTotal,
       ledFileIgst, ledFileCgst, ledFileSgst, ledFileTotal,
-      finalEligibleRefund, finalIgst, finalCgst, finalSgst, deadlineStr
+      finalEligibleRefund, finalIgst, finalCgst, finalSgst,
+      deadlineStr, isWithinLimitation, appDateStr
     };
 
     // 8. Update Top KPI Strip
@@ -3303,8 +3461,14 @@
     setTextVal("kpiFinalRefund", "₹" + fmtINR(finalEligibleRefund));
     setTextVal("kpiFinalRefundSub", `Formula: ₹${fmtINR(formulaMaxRefund)} | Cap: ₹${fmtINR(ledEndTotal)}`);
     setTextVal("kpiDeadlineDate", deadlineStr);
+    setTextVal(
+      "kpiDeadlineSub",
+      isWithinLimitation
+        ? "Sec 54(1) Limitation Check: VALID"
+        : "⚠ TIME-BARRED: Past 2-Yr Sec 54(1) Limit!"
+    );
 
-    // 9. Update Tab 3 (Portal Filling Guide — All Rows Synced)
+    // 9. Update Tab 3 (Portal Filling Guide — Exact Head-Wise Scaling for CGST/SGST/IGST)
     const rCfg = REFUND_TYPE_CONFIG[APP_STATE.refundType] || REFUND_TYPE_CONFIG.INVITC;
     setTextVal("portalGuideCategoryBadge", `${rCfg.code} — ${rCfg.name}`);
     const formulaBox = document.getElementById("portalFormulaExplanationBox");
@@ -3316,12 +3480,18 @@
     setTextVal("t1Col4Val", col4.toFixed(2));
     setTextVal("t1Col5Val", formulaMaxRefund.toFixed(2));
 
-    setTextVal("t1CgstTaxShow", fmtINR(col2 / 2));
-    setTextVal("t1SgstTaxShow", fmtINR(col2 / 2));
+    const taxScale = invOutTotalTax > 0 ? (col2 / invOutTotalTax) : 0;
+    const scaledCgstTax = r2(invOutCgst * taxScale);
+    const scaledSgstTax = r2(invOutSgst * taxScale);
+    const itcCgstShare = elgTotal > 0 ? r2(formulaMaxRefund * (elgCgst / elgTotal)) : r2(formulaMaxRefund / 2);
+    const itcSgstShare = elgTotal > 0 ? r2(formulaMaxRefund * (elgSgst / elgTotal)) : r2(formulaMaxRefund / 2);
+
+    setTextVal("t1CgstTaxShow", fmtINR(scaledCgstTax));
+    setTextVal("t1SgstTaxShow", fmtINR(scaledSgstTax));
     setTextVal("t1CgstItcShow", fmtINR(elgCgst));
     setTextVal("t1SgstItcShow", fmtINR(elgSgst));
-    setTextVal("t1CgstMaxShow", fmtINR(formulaMaxRefund / 2));
-    setTextVal("t1SgstMaxShow", fmtINR(formulaMaxRefund / 2));
+    setTextVal("t1CgstMaxShow", fmtINR(itcCgstShare));
+    setTextVal("t1SgstMaxShow", fmtINR(itcSgstShare));
 
     setTextVal("t1TotalCol1", fmtINR(col1));
     setTextVal("t1TotalCol2", fmtINR(col2));
@@ -3352,6 +3522,13 @@
     const box = document.getElementById("auditAlertsContainer");
     if (!box) return;
     const alerts = [];
+
+    if (!c.isWithinLimitation) {
+      alerts.push({
+        type: "err",
+        html: `<strong>❌ Section 54(1) Limitation Alert:</strong> Your entered Filing Date (<strong>${escHtml(c.appDateStr)}</strong>) exceeds the 2-year statutory deadline (<strong>${escHtml(c.deadlineStr)}</strong>) from the due date of the last return period!`
+      });
+    }
 
     alerts.push({
       type: "ok",
@@ -3407,17 +3584,17 @@
       const inM = c.inFiltered.filter(x => x.prd === m);
       const outM = c.outFiltered.filter(x => x.prd === m);
 
-      const gTaxable = inM.reduce((s, x) => s + Number(x.val), 0);
-      const gItc = inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const exItc = inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const elTaxable = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0);
-      const elItc = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
+      const gTaxable = r2(inM.reduce((s, x) => s + Number(x.val), 0));
+      const gItc = r2(inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const exItc = r2(inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const elTaxable = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0));
+      const elItc = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
 
-      const oInvTurn = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0);
-      const oNonInvTurn = outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0);
-      const oTotTurn = oInvTurn + oNonInvTurn;
-      const oInvTax = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const oTotTax = outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
+      const oInvTurn = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0));
+      const oNonInvTurn = r2(outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0));
+      const oTotTurn = r2(oInvTurn + oNonInvTurn);
+      const oInvTax = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const oTotTax = r2(outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
 
       const g3b = APP_STATE.gstr3bByMonth[m];
       let statusBadge = `<span style="color:var(--success); font-weight:700;">✓ Reconciled</span>`;
@@ -3445,15 +3622,15 @@
       </tr>`;
     });
 
-    const b2bInTaxable = c.inFiltered.reduce((s, x) => s + Number(x.val), 0);
-    const b2bOutInv = c.outFiltered.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0);
-    const b2bOutNon = c.outFiltered.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0);
-    const diffInTaxable = +(c.gross2BTaxable - b2bInTaxable).toFixed(2);
-    const diffOutInv = +(c.invTurnTaxable - b2bOutInv).toFixed(2);
-    const diffOutNon = +(c.nonInvTurnTaxable - b2bOutNon).toFixed(2);
+    const b2bInTaxable = r2(c.inFiltered.reduce((s, x) => s + Number(x.val), 0));
+    const b2bOutInv = r2(c.outFiltered.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0));
+    const b2bOutNon = r2(c.outFiltered.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0));
+    const diffInTaxable = r2(c.gross2BTaxable - b2bInTaxable);
+    const diffOutInv = r2(c.invTurnTaxable - b2bOutInv);
+    const diffOutNon = r2(c.nonInvTurnTaxable - b2bOutNon);
 
     if (Math.abs(diffInTaxable) > 0.01 || Math.abs(diffOutInv) > 0.01 || Math.abs(diffOutNon) > 0.01) {
-      const othItc = getNumVal("othInCdnCgst") + getNumVal("othInCdnSgst") + getNumVal("othInBoEIgst");
+      const othItc = r2(getNumVal("othInCdnCgst") + getNumVal("othInCdnSgst") + getNumVal("othInBoEIgst"));
       rowsHtml += `<tr style="background:#eff6ff;">
         <td class="center"><strong>B2C / 6A / CDNR</strong></td>
         <td>${fmtINR(diffInTaxable)}</td>
@@ -3502,7 +3679,7 @@
         const inPeriod = p >= minPrd && p <= maxPrd;
         if (APP_STATE.hideOutOfPeriodRows && !inPeriod) return "";
         visibleIdx++;
-        const tot = +(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt)).toFixed(2);
+        const tot = r2(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt));
         const isExcl = inv.cat !== "Inputs";
         return `<tr class="${isExcl ? 'row-excluded' : ''}" style="${!inPeriod ? 'opacity:0.45;' : ''}">
           <td class="center">${visibleIdx}</td>
@@ -3550,7 +3727,7 @@
         const inPeriod = p >= minPrd && p <= maxPrd;
         if (APP_STATE.hideOutOfPeriodRows && !inPeriod) return "";
         visibleOutIdx++;
-        const tot = +(Number(out.camt) + Number(out.samt) + Number(out.iamt)).toFixed(2);
+        const tot = r2(Number(out.camt) + Number(out.samt) + Number(out.iamt));
         return `<tr class="${!out.isInv ? 'row-excluded' : ''}" style="${!inPeriod ? 'opacity:0.45;' : ''}">
           <td class="center">${visibleOutIdx}</td>
           <td class="center">${escHtml(out.prd)} ${!inPeriod ? '<span class="badge-pill" style="background:#fee2e2;color:#991b1b;">Out of Period</span>' : ''}</td>
@@ -3590,12 +3767,14 @@
     if (APP_STATE.inwardInvoices[idx]) {
       APP_STATE.inwardInvoices[idx].cat = val;
       APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+      clearCustomDocHtmlState();
       recalculateAll();
     }
   }
   function deleteInwardInvoice(idx) {
     APP_STATE.inwardInvoices.splice(idx, 1);
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
   function autoExcludeNonInvertedInputs() {
@@ -3603,6 +3782,7 @@
       inv.cat = Number(inv.rt) <= 5 ? "Excluded" : "Inputs";
     });
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
   function toggleAddInwardRow() {
@@ -3617,13 +3797,13 @@
     const idt = document.getElementById("newInIdt").value.trim();
     const prd = document.getElementById("newInPrd").value.trim() || dateToPeriodMMYYYY(idt);
     const hsn = document.getElementById("newInHsn").value.trim() || comp.hsnDefault || "4819";
-    const val = parseFloat(document.getElementById("newInVal").value) || 0;
+    const val = r2(parseFloat(document.getElementById("newInVal").value) || 0);
     const rt = parseInt(document.getElementById("newInRate").value, 10) || 18;
     if (!stin || !inum || val <= 0) { alert("Enter Supplier GSTIN, Invoice No., and Taxable Value."); return; }
 
     const isInterState = stin.length >= 2 && comp.gstin.length >= 2 && stin.slice(0, 2) !== comp.gstin.slice(0, 2);
-    const totalTax = +(val * (rt / 100)).toFixed(2);
-    const halfTax = +(totalTax / 2).toFixed(2);
+    const totalTax = r2(val * (rt / 100));
+    const halfTax = r2(totalTax / 2);
 
     APP_STATE.inwardInvoices.push({
       stin, snm, inum, idt, prd, hsn, rt, val,
@@ -3634,6 +3814,7 @@
       fildt: "", portcd: "", idtype: "Invoice/Bill of Entry"
     });
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
 
@@ -3641,12 +3822,14 @@
     if (APP_STATE.outwardInvoices[idx]) {
       APP_STATE.outwardInvoices[idx].isInv = (val === "true");
       APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+      clearCustomDocHtmlState();
       recalculateAll();
     }
   }
   function deleteOutwardInvoice(idx) {
     APP_STATE.outwardInvoices.splice(idx, 1);
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
   function autoClassifyOutwardInvoices() {
@@ -3654,6 +3837,7 @@
       out.isInv = Number(out.rt) <= 12;
     });
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
   function toggleAddOutwardRow() {
@@ -3666,24 +3850,25 @@
     const inum = document.getElementById("newOutInum").value.trim();
     const idt = document.getElementById("newOutIdt").value.trim();
     const prd = document.getElementById("newOutPrd").value.trim() || dateToPeriodMMYYYY(idt);
-    const val = parseFloat(document.getElementById("newOutVal").value) || 0;
+    const val = r2(parseFloat(document.getElementById("newOutVal").value) || 0);
     const rt = parseInt(document.getElementById("newOutRate").value, 10) || 5;
     const isInv = document.getElementById("newOutInvFlag").value === "true";
     if (!ctin || !inum || val <= 0) { alert("Enter Recipient GSTIN, Invoice No., and Taxable Value."); return; }
 
     const isInterState = ctin.length >= 2 && comp.gstin.length >= 2 && ctin.slice(0, 2) !== comp.gstin.slice(0, 2);
-    const totalTax = +(val * (rt / 100)).toFixed(2);
-    const halfTax = +(totalTax / 2).toFixed(2);
+    const totalTax = r2(val * (rt / 100));
+    const halfTax = r2(totalTax / 2);
 
     APP_STATE.outwardInvoices.push({
       prd, ctin, inum, idt, rt, val,
       camt: isInterState ? 0 : halfTax,
       samt: isInterState ? 0 : halfTax,
       iamt: isInterState ? totalTax : 0,
-      invVal: +(val + totalTax).toFixed(2),
+      invVal: r2(val + totalTax),
       isInv
     });
     APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+    clearCustomDocHtmlState();
     recalculateAll();
   }
 
@@ -3693,7 +3878,7 @@
     alert("Copied to clipboard: " + txt);
   }
 
-  // 18. Schema-Aware Portal JSON Exporters (Statement 1A / 2 / 3 & Annexure-B)
+  // 18. Schema-Aware Portal JSON Exporters (Statement 1A / 2 / 3 & Annexure-B with r2() rounding)
   function downloadGeneratedStmt1A() {
     const comp = getActiveCompany();
     const c = APP_STATE.calc;
@@ -3704,8 +3889,15 @@
     if ((APP_STATE.refundType === "EXPWOP" || APP_STATE.refundType === "EXPWP") && APP_STATE.otherTables.exp6AList.length > 0) {
       const stmtKey = APP_STATE.refundType === "EXPWP" ? "stmt02" : "stmt03";
       const expRows = APP_STATE.otherTables.exp6AList.map((ex, i) => ({
-        sno: i + 1, inum: ex.inum, idt: ex.idt, val: ex.val, txval: ex.txval, iamt: ex.iamt,
-        sbpcode: ex.sbpcode || "", sbnum: ex.sbnum || "", sbdt: ex.sbdt || ""
+        sno: i + 1,
+        inum: ex.inum,
+        idt: ex.idt,
+        val: r2(ex.val),
+        txval: r2(ex.txval),
+        iamt: r2(ex.iamt),
+        sbpcode: ex.sbpcode || "",
+        sbnum: ex.sbnum || "",
+        sbdt: ex.sbdt || ""
       }));
       const expPayload = {
         gstin: comp.gstin, fromFp: `${fm}${fy}`, toFp: `${tm}${ty}`,
@@ -3718,11 +3910,14 @@
 
     const elgIn = c.inFiltered.filter(x => x.cat === "Inputs");
     const invOut = [...c.outFiltered.filter(x => x.isInv)];
-    const b2cInvVal = getNumVal("othB2cInvVal");
+    const b2cInvVal = r2(getNumVal("othB2cInvVal"));
     if (b2cInvVal > 0) {
       invOut.push({
-        ostype: "B2C", val: b2cInvVal,
-        camt: getNumVal("othB2cInvCgst"), samt: getNumVal("othB2cInvSgst"), iamt: getNumVal("othB2cInvIgst")
+        ostype: "B2C",
+        val: b2cInvVal,
+        camt: r2(getNumVal("othB2cInvCgst")),
+        samt: r2(getNumVal("othB2cInvSgst")),
+        iamt: r2(getNumVal("othB2cInvIgst"))
       });
     }
 
@@ -3740,28 +3935,28 @@
         row.inum = String(inn.inum);
         row.idt = inn.idt;
         row.portcd = inn.portcd || "";
-        row.val = Number(inn.val);
-        row.iamt = Number(inn.iamt) || 0;
-        row.camt = Number(inn.camt) || 0;
-        row.samt = Number(inn.samt) || 0;
+        row.val = r2(inn.val);
+        row.iamt = r2(inn.iamt);
+        row.camt = r2(inn.camt);
+        row.samt = r2(inn.samt);
       }
       if (i < invOut.length) {
         const out = invOut[i];
         if (out.ostype === "B2C") {
           row.ostype = "B2C";
-          row.oval = Number(out.val);
-          row.oiamt = Number(out.iamt) || 0;
-          row.ocamt = Number(out.camt) || 0;
-          row.osamt = Number(out.samt) || 0;
+          row.oval = r2(out.val);
+          row.oiamt = r2(out.iamt);
+          row.ocamt = r2(out.camt);
+          row.osamt = r2(out.samt);
         } else {
           row.ostype = "B2B";
           row.odtype = out.odtype || "Invoice/Bill of Entry";
           row.oinum = String(out.inum);
           row.oidt = out.idt;
-          row.oval = Number(out.val);
-          row.oiamt = Number(out.iamt) || 0;
-          row.ocamt = Number(out.camt) || 0;
-          row.osamt = Number(out.samt) || 0;
+          row.oval = r2(out.val);
+          row.oiamt = r2(out.iamt);
+          row.ocamt = r2(out.camt);
+          row.osamt = r2(out.samt);
         }
       }
       stmtRows.push(row);
@@ -3784,7 +3979,7 @@
     const [ty, tm] = APP_STATE.toPeriod.split("-");
 
     const invoices = elgIn.map((inn, idx) => {
-      const tot = +(Number(inn.camt) + Number(inn.samt) + Number(inn.iamt)).toFixed(2);
+      const tot = r2(Number(inn.camt) + Number(inn.samt) + Number(inn.iamt));
       const isBoe = inn.idtype === "Bill of Entry";
       return {
         sno: idx + 1,
@@ -3795,12 +3990,12 @@
         inum: String(inn.inum),
         idt: inn.idt,
         portCode: inn.portcd || "",
-        val: Number(inn.val),
+        val: r2(inn.val),
         catOfInv: "Inputs",
         hsnSac: String(inn.hsn || comp.hsnDefault),
-        camt: Number(inn.camt) || 0,
-        samt: Number(inn.samt) || 0,
-        iamt: Number(inn.iamt) || 0,
+        camt: r2(inn.camt),
+        samt: r2(inn.samt),
+        iamt: r2(inn.iamt),
         cessamt: 0,
         totCredit: tot,
         isItcBlocked: "No",
@@ -3811,8 +4006,8 @@
       };
     });
 
-    const revCgst = Math.abs(Math.min(0, getNumVal("othInCdnCgst")));
-    const revSgst = Math.abs(Math.min(0, getNumVal("othInCdnSgst")));
+    const revCgst = Math.abs(Math.min(0, r2(getNumVal("othInCdnCgst"))));
+    const revSgst = Math.abs(Math.min(0, r2(getNumVal("othInCdnSgst"))));
     const payload = {
       gstin: comp.gstin, fromFp: `${fm}${fy}`, toFp: `${tm}${ty}`,
       version: cfg.annexBVersion || "1.0",
@@ -3870,25 +4065,25 @@
     months.forEach(m => {
       const inM = c.inFiltered.filter(x => x.prd === m);
       const outM = c.outFiltered.filter(x => x.prd === m);
-      const gTax = inM.reduce((s, x) => s + Number(x.val), 0);
-      const gItc = inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const exItc = inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const elTax = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0);
-      const elItc = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const oInv = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0);
-      const oNon = outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0);
-      const oInvTax = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      const oTotTax = outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-      lines.push(`"${m}",${gTax.toFixed(2)},${gItc.toFixed(2)},${exItc.toFixed(2)},${elTax.toFixed(2)},${elItc.toFixed(2)},${oInv.toFixed(2)},${oNon.toFixed(2)},${(oInv+oNon).toFixed(2)},${oInvTax.toFixed(2)},${oTotTax.toFixed(2)}`);
+      const gTax = r2(inM.reduce((s, x) => s + Number(x.val), 0));
+      const gItc = r2(inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const exItc = r2(inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const elTax = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0));
+      const elItc = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const oInv = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0));
+      const oNon = r2(outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0));
+      const oInvTax = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      const oTotTax = r2(outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+      lines.push(`"${m}",${gTax.toFixed(2)},${gItc.toFixed(2)},${exItc.toFixed(2)},${elTax.toFixed(2)},${elItc.toFixed(2)},${oInv.toFixed(2)},${oNon.toFixed(2)},${r2(oInv+oNon).toFixed(2)},${oInvTax.toFixed(2)},${oTotTax.toFixed(2)}`);
     });
-    lines.push(`"TOTAL",${c.gross2BTaxable.toFixed(2)},${c.gross2BTotal.toFixed(2)},${(c.excl5Total+c.servCapTotal).toFixed(2)},${c.elgTaxable.toFixed(2)},${c.elgTotal.toFixed(2)},${c.invTurnTaxable.toFixed(2)},${c.nonInvTurnTaxable.toFixed(2)},${c.adjTotalTurnover.toFixed(2)},${c.invOutTotalTax.toFixed(2)},${c.totalOutTaxAll.toFixed(2)}`);
+    lines.push(`"TOTAL",${c.gross2BTaxable.toFixed(2)},${c.gross2BTotal.toFixed(2)},${r2(c.excl5Total+c.servCapTotal).toFixed(2)},${c.elgTaxable.toFixed(2)},${c.elgTotal.toFixed(2)},${c.invTurnTaxable.toFixed(2)},${c.nonInvTurnTaxable.toFixed(2)},${c.adjTotalTurnover.toFixed(2)},${c.invOutTotalTax.toFixed(2)},${c.totalOutTaxAll.toFixed(2)}`);
     lines.push("");
 
     // TABLE 4: Inward Supplies Register
     lines.push(`"PART 4: INWARD SUPPLIES REGISTER (GSTR-2B vs STATEMENT 1A & ANNEXURE-B)"`);
     lines.push(`"S.No.","Supplier GSTIN","Supplier Name","Invoice No.","Invoice Date","2B Period","HSN","Rate (%)","Taxable Value","CGST","SGST","IGST","Total ITC","Eligibility Status"`);
     c.inFiltered.forEach((inv, idx) => {
-      const tot = +(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt)).toFixed(2);
+      const tot = r2(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt));
       lines.push(`${idx + 1},"${inv.stin}","${String(inv.snm).replace(/"/g, '""')}","${inv.inum}","${inv.idt}","${inv.prd}","${inv.hsn}",${inv.rt},${Number(inv.val).toFixed(2)},${Number(inv.camt).toFixed(2)},${Number(inv.samt).toFixed(2)},${Number(inv.iamt).toFixed(2)},${tot.toFixed(2)},"${inv.cat}"`);
     });
     lines.push(`"","TOTAL ELIGIBLE INPUTS (${c.elgCount} Invoices)","","","","","","",${c.elgTaxable.toFixed(2)},${c.elgCgst.toFixed(2)},${c.elgSgst.toFixed(2)},${c.elgIgst.toFixed(2)},${c.elgTotal.toFixed(2)},"Claimed in Stmt 1A"`);
@@ -3898,22 +4093,22 @@
     lines.push(`"PART 5: OUTWARD B2B SUPPLIES REGISTER (GSTR-1 vs STATEMENT 1A)"`);
     lines.push(`"S.No.","Return Period","Recipient GSTIN","Invoice No.","Invoice Date","Rate (%)","Taxable Value","CGST","SGST","IGST","Total Tax","Classification"`);
     c.outFiltered.forEach((out, idx) => {
-      const tot = +(Number(out.camt) + Number(out.samt) + Number(out.iamt)).toFixed(2);
+      const tot = r2(Number(out.camt) + Number(out.samt) + Number(out.iamt));
       lines.push(`${idx + 1},"${out.prd}","${out.ctin}","${out.inum}","${out.idt}",${out.rt},${Number(out.val).toFixed(2)},${Number(out.camt).toFixed(2)},${Number(out.samt).toFixed(2)},${Number(out.iamt).toFixed(2)},${tot.toFixed(2)},"${out.isInv ? 'Inverted (Col 1 & 3)' : 'Non-Inverted (Col 3 Only)'}"`);
     });
     lines.push(`"","TOTAL INVERTED OUTWARD (${c.invOutCount} Invoices)","","","","",${c.invTurnTaxable.toFixed(2)},${c.invOutCgst.toFixed(2)},${c.invOutSgst.toFixed(2)},${c.invOutIgst.toFixed(2)},${c.invOutTotalTax.toFixed(2)},"Col (1) & Col (2)"`);
-    lines.push(`"","ADJUSTED TOTAL TURNOVER (${c.outFiltered.length} Invoices)","","","","",${c.adjTotalTurnover.toFixed(2)},${(c.invOutCgst+c.nonInvCgst).toFixed(2)},${(c.invOutSgst+c.nonInvSgst).toFixed(2)},${(c.invOutIgst+c.nonInvIgst).toFixed(2)},${c.totalOutTaxAll.toFixed(2)},"Col (3) Total"`);
+    lines.push(`"","ADJUSTED TOTAL TURNOVER (${c.outFiltered.length} Invoices)","","","","",${c.adjTotalTurnover.toFixed(2)},${r2(c.invOutCgst+c.nonInvCgst).toFixed(2)},${r2(c.invOutSgst+c.nonInvSgst).toFixed(2)},${r2(c.invOutIgst+c.nonInvIgst).toFixed(2)},${c.totalOutTaxAll.toFixed(2)},"Col (3) Total"`);
     lines.push("");
 
     // TABLE 6: Other GSTR-1 & GSTR-2B Tables Summary
     lines.push(`"PART 6: OTHER GSTR-1 & GSTR-2B TABLES SUMMARY (B2C, EXPORT 6A, SEZ, CDNR, NIL, BOE)"`);
     lines.push(`"Table / Section","Taxable Value / Net Turnover","CGST","SGST","IGST","Total Tax / ITC"`);
-    lines.push(`"B2C Inverted Supplies (5%/12%)",${getNumVal("othB2cInvVal").toFixed(2)},${getNumVal("othB2cInvCgst").toFixed(2)},${getNumVal("othB2cInvSgst").toFixed(2)},${getNumVal("othB2cInvIgst").toFixed(2)},${(getNumVal("othB2cInvCgst")+getNumVal("othB2cInvSgst")+getNumVal("othB2cInvIgst")).toFixed(2)}`);
-    lines.push(`"B2C Non-Inverted Supplies (18%/28%)",${getNumVal("othB2cNonVal").toFixed(2)},${getNumVal("othB2cNonCgst").toFixed(2)},${getNumVal("othB2cNonSgst").toFixed(2)},${getNumVal("othB2cNonIgst").toFixed(2)},${(getNumVal("othB2cNonCgst")+getNumVal("othB2cNonSgst")+getNumVal("othB2cNonIgst")).toFixed(2)}`);
+    lines.push(`"B2C Inverted Supplies (5%/12%)",${getNumVal("othB2cInvVal").toFixed(2)},${getNumVal("othB2cInvCgst").toFixed(2)},${getNumVal("othB2cInvSgst").toFixed(2)},${getNumVal("othB2cInvIgst").toFixed(2)},${r2(getNumVal("othB2cInvCgst")+getNumVal("othB2cInvSgst")+getNumVal("othB2cInvIgst")).toFixed(2)}`);
+    lines.push(`"B2C Non-Inverted Supplies (18%/28%)",${getNumVal("othB2cNonVal").toFixed(2)},${getNumVal("othB2cNonCgst").toFixed(2)},${getNumVal("othB2cNonSgst").toFixed(2)},${getNumVal("othB2cNonIgst").toFixed(2)},${r2(getNumVal("othB2cNonCgst")+getNumVal("othB2cNonSgst")+getNumVal("othB2cNonIgst")).toFixed(2)}`);
     lines.push(`"Exports Table 6A",${getNumVal("othExp6AVal").toFixed(2)},0.00,0.00,${getNumVal("othExp6AIgst").toFixed(2)},${getNumVal("othExp6AIgst").toFixed(2)}`);
-    lines.push(`"SEZ & Deemed Exports",${getNumVal("othSezVal").toFixed(2)},${getNumVal("othSezCgst").toFixed(2)},${getNumVal("othSezSgst").toFixed(2)},${getNumVal("othSezIgst").toFixed(2)},${(getNumVal("othSezCgst")+getNumVal("othSezSgst")+getNumVal("othSezIgst")).toFixed(2)}`);
-    lines.push(`"Outward CDNR (Net)",${getNumVal("othOutCdnVal").toFixed(2)},${getNumVal("othOutCdnCgst").toFixed(2)},${getNumVal("othOutCdnSgst").toFixed(2)},${getNumVal("othOutCdnIgst").toFixed(2)},${(getNumVal("othOutCdnCgst")+getNumVal("othOutCdnSgst")+getNumVal("othOutCdnIgst")).toFixed(2)}`);
-    lines.push(`"Inward CDNR & BOE Adj.",${getNumVal("othInBoEVal").toFixed(2)},${getNumVal("othInCdnCgst").toFixed(2)},${getNumVal("othInCdnSgst").toFixed(2)},${getNumVal("othInBoEIgst").toFixed(2)},${(getNumVal("othInCdnCgst")+getNumVal("othInCdnSgst")+getNumVal("othInBoEIgst")).toFixed(2)}`);
+    lines.push(`"SEZ & Deemed Exports",${getNumVal("othSezVal").toFixed(2)},${getNumVal("othSezCgst").toFixed(2)},${getNumVal("othSezSgst").toFixed(2)},${getNumVal("othSezIgst").toFixed(2)},${r2(getNumVal("othSezCgst")+getNumVal("othSezSgst")+getNumVal("othSezIgst")).toFixed(2)}`);
+    lines.push(`"Outward CDNR (Net)",${getNumVal("othOutCdnVal").toFixed(2)},${getNumVal("othOutCdnCgst").toFixed(2)},${getNumVal("othOutCdnSgst").toFixed(2)},${getNumVal("othOutCdnIgst").toFixed(2)},${r2(getNumVal("othOutCdnCgst")+getNumVal("othOutCdnSgst")+getNumVal("othOutCdnIgst")).toFixed(2)}`);
+    lines.push(`"Inward CDNR & BOE Adj.",${getNumVal("othInBoEVal").toFixed(2)},${getNumVal("othInCdnCgst").toFixed(2)},${getNumVal("othInCdnSgst").toFixed(2)},${getNumVal("othInBoEIgst").toFixed(2)},${r2(getNumVal("othInCdnCgst")+getNumVal("othInCdnSgst")+getNumVal("othInBoEIgst")).toFixed(2)}`);
 
     // TABLE 7: Electronic Credit & Cash Ledger Passbook Rows (if loaded)
     if (APP_STATE.creditLedgerEntries.length > 0 || APP_STATE.cashLedgerEntries.length > 0) {
@@ -3939,11 +4134,15 @@
     URL.revokeObjectURL(url);
   }
 
-  // 20. Edit-Preserving Document 1, 2 & 4 Renderer with Logo.png Support
+  // 20. Edit-Preserving Document 1, 2 & 4 Renderer with Full IGST Columns & LocalStorage Edit Recovery
   function renderPrintableDocuments(forceReset) {
     if (forceReset) {
       APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+      clearCustomDocHtmlState();
+    } else {
+      restoreCustomDocHtmlIfEdited();
     }
+
     const comp = getActiveCompany();
     const c = APP_STATE.calc;
     const cfg = APP_STATE.schemaConfig;
@@ -4020,23 +4219,23 @@
       `;
     }
 
-    // DOCUMENT 2: RECONCILIATION STATEMENT (2-Page A4 Landscape)
+    // DOCUMENT 2: RECONCILIATION STATEMENT (2-Page A4 Landscape — Now with IGST Columns in Tables 2 & 4)
     const doc2El = document.getElementById("sheet-doc2");
     if (doc2El && !APP_STATE.docEdited.doc2) {
       const months = getMonthRangeList(APP_STATE.fromPeriod, APP_STATE.toPeriod);
       const monthRowsHtml = months.map(m => {
         const inM = c.inFiltered.filter(x => x.prd === m);
         const outM = c.outFiltered.filter(x => x.prd === m);
-        const gTax = inM.reduce((s, x) => s + Number(x.val), 0);
-        const gItc = inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-        const exItc = inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-        const elTax = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0);
-        const elItc = inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-        const oInv = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0);
-        const oNon = outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0);
-        const oTot = oInv + oNon;
-        const oInvTax = outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
-        const oTotTax = outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0);
+        const gTax = r2(inM.reduce((s, x) => s + Number(x.val), 0));
+        const gItc = r2(inM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+        const exItc = r2(inM.filter(x => x.cat !== "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+        const elTax = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.val), 0));
+        const elItc = r2(inM.filter(x => x.cat === "Inputs").reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+        const oInv = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.val), 0));
+        const oNon = r2(outM.filter(x => !x.isInv).reduce((s, x) => s + Number(x.val), 0));
+        const oTot = r2(oInv + oNon);
+        const oInvTax = r2(outM.filter(x => x.isInv).reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
+        const oTotTax = r2(outM.reduce((s, x) => s + Number(x.camt) + Number(x.samt) + Number(x.iamt), 0));
         return `<tr>
           <td class="center">${m}</td>
           <td>${fmtINR(gTax)}</td><td>${fmtINR(gItc)}</td><td>${fmtINR(exItc)}</td>
@@ -4048,7 +4247,7 @@
 
       const elgInvoices = c.inFiltered.filter(x => x.cat === "Inputs");
       const invRowsHtml = elgInvoices.map((inv, idx) => {
-        const tot = +(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt)).toFixed(2);
+        const tot = r2(Number(inv.camt) + Number(inv.samt) + Number(inv.iamt));
         return `<tr>
           <td class="center">${idx + 1}</td>
           <td class="left">${escHtml(inv.stin || "IMPORT_BOE")}</td>
@@ -4060,6 +4259,7 @@
           <td>${fmtINR(inv.val)}</td>
           <td>${fmtINR(inv.camt)}</td>
           <td>${fmtINR(inv.samt)}</td>
+          <td>${fmtINR(inv.iamt)}</td>
           <td>${fmtINR(tot)}</td>
           <td class="center">${escHtml(inv.prd)}</td>
           <td class="center">Matched in 2B</td>
@@ -4139,6 +4339,7 @@
                 <th>Taxable Turnover (Rs.)</th>
                 <th>CGST (Rs.)</th>
                 <th>SGST (Rs.)</th>
+                <th>IGST (Rs.)</th>
                 <th>Total Output Tax (Rs.)</th>
                 <th>Gross Invoice Value (Rs.)</th>
                 <th class="center">RFD-01 Mapping</th>
@@ -4149,35 +4350,35 @@
                 <td class="center">1</td>
                 <td class="left">Outward B2B Supplies taxed @ 12% (${c.out12Count} Invoices)</td>
                 <td class="center">${c.out12Count}</td>
-                <td>${fmtINR(c.out12Taxable)}</td><td>${fmtINR(c.out12Cgst)}</td><td>${fmtINR(c.out12Sgst)}</td><td>${fmtINR(c.out12TotalTax)}</td><td>${fmtINR(c.out12GrossVal)}</td>
+                <td>${fmtINR(c.out12Taxable)}</td><td>${fmtINR(c.out12Cgst)}</td><td>${fmtINR(c.out12Sgst)}</td><td>${fmtINR(c.out12Igst)}</td><td>${fmtINR(c.out12TotalTax)}</td><td>${fmtINR(c.out12GrossVal)}</td>
                 <td class="center">Included in Stmt 1A</td>
               </tr>
               <tr>
                 <td class="center">2</td>
                 <td class="left">Outward B2B Supplies taxed @ 5% (${c.out5Count} Invoices)</td>
                 <td class="center">${c.out5Count}</td>
-                <td>${fmtINR(c.out5Taxable)}</td><td>${fmtINR(c.out5Cgst)}</td><td>${fmtINR(c.out5Sgst)}</td><td>${fmtINR(c.out5TotalTax)}</td><td>${fmtINR(c.out5GrossVal)}</td>
+                <td>${fmtINR(c.out5Taxable)}</td><td>${fmtINR(c.out5Cgst)}</td><td>${fmtINR(c.out5Sgst)}</td><td>${fmtINR(c.out5Igst)}</td><td>${fmtINR(c.out5TotalTax)}</td><td>${fmtINR(c.out5GrossVal)}</td>
                 <td class="center">Included in Stmt 1A</td>
               </tr>
               <tr class="bold-row">
                 <td class="center">3</td>
                 <td class="left">Total Inverted / Qualifying Outward Supplies [Matched with Statement 1A &amp; Table-1 Col (1)]</td>
                 <td class="center">${c.invOutCount}</td>
-                <td>${fmtINR(c.invTurnTaxable)}</td><td>${fmtINR(c.invOutCgst)}</td><td>${fmtINR(c.invOutSgst)}</td><td>${fmtINR(c.invOutTotalTax)}</td><td>${fmtINR(c.invOutGrossVal)}</td>
+                <td>${fmtINR(c.invTurnTaxable)}</td><td>${fmtINR(c.invOutCgst)}</td><td>${fmtINR(c.invOutSgst)}</td><td>${fmtINR(c.invOutIgst)}</td><td>${fmtINR(c.invOutTotalTax)}</td><td>${fmtINR(c.invOutGrossVal)}</td>
                 <td class="center">Table-1 Col (1) &amp; (2)</td>
               </tr>
               <tr>
                 <td class="center">4</td>
                 <td class="left">Non-Inverted Outward Supplies taxed @ 18% (${c.nonInvCount} B2B Invoices + Other Non-Inv.)</td>
                 <td class="center">${c.nonInvCount}</td>
-                <td>${fmtINR(c.nonInvTurnTaxable)}</td><td>${fmtINR(c.nonInvCgst)}</td><td>${fmtINR(c.nonInvSgst)}</td><td>${fmtINR(c.nonInvTotalTax)}</td><td>${fmtINR(c.nonInvGrossVal)}</td>
+                <td>${fmtINR(c.nonInvTurnTaxable)}</td><td>${fmtINR(c.nonInvCgst)}</td><td>${fmtINR(c.nonInvSgst)}</td><td>${fmtINR(c.nonInvIgst)}</td><td>${fmtINR(c.nonInvTotalTax)}</td><td>${fmtINR(c.nonInvGrossVal)}</td>
                 <td class="center">Included in Col (3) Only</td>
               </tr>
               <tr class="bold-row">
                 <td class="center">5</td>
                 <td class="left">Adjusted Total Outward Turnover as per Form GSTR-1 / GSTR-3B (3 + 4)</td>
                 <td class="center">${c.outFiltered.length}</td>
-                <td>${fmtINR(c.adjTotalTurnover)}</td><td>${fmtINR(c.invOutCgst + c.nonInvCgst)}</td><td>${fmtINR(c.invOutSgst + c.nonInvSgst)}</td><td>${fmtINR(c.totalOutTaxAll)}</td><td>${fmtINR(c.totalOutGrossValAll)}</td>
+                <td>${fmtINR(c.adjTotalTurnover)}</td><td>${fmtINR(c.invOutCgst + c.nonInvCgst)}</td><td>${fmtINR(c.invOutSgst + c.nonInvSgst)}</td><td>${fmtINR(c.invOutIgst + c.nonInvIgst)}</td><td>${fmtINR(c.totalOutTaxAll)}</td><td>${fmtINR(c.totalOutGrossValAll)}</td>
                 <td class="center">Table-1 Col (3) Total</td>
               </tr>
             </tbody>
@@ -4229,6 +4430,7 @@
                 <th>Taxable Value (Rs.)</th>
                 <th>CGST (Rs.)</th>
                 <th>SGST (Rs.)</th>
+                <th>IGST (Rs.)</th>
                 <th>Total ITC (Rs.)</th>
                 <th class="center">2B Period</th>
                 <th class="center">2B/3B Status</th>
@@ -4244,6 +4446,7 @@
                 <td>${fmtINR(c.elgTaxable)}</td>
                 <td>${fmtINR(c.elgCgst)}</td>
                 <td>${fmtINR(c.elgSgst)}</td>
+                <td>${fmtINR(c.elgIgst)}</td>
                 <td>${fmtINR(c.elgTotal)}</td>
                 <td class="center"></td>
                 <td class="center">100% Matched</td>
@@ -4305,7 +4508,18 @@
     }
   }
 
-  // Orientation-Smart Print / PDF Export Controller
+  // Orientation-Smart Print / PDF Export Controller (Patched with afterprint for Mobile Chrome)
+  function restoreAllPrintWrappers() {
+    ["doc1", "doc2", "doc4"].forEach(k => {
+      const wrap = document.getElementById("wrap-" + k);
+      if (wrap) wrap.classList.remove("doc-wrapper-print-hide");
+    });
+    const s1 = document.getElementById("sheet-doc1");
+    if (s1) s1.classList.remove("page-break-after");
+  }
+
+  window.addEventListener("afterprint", restoreAllPrintWrappers);
+
   function printSingleDoc(docKey, orientation) {
     const styleEl = document.getElementById("dynamicPageStyle");
     if (styleEl) {
@@ -4321,12 +4535,6 @@
       }
     });
     window.print();
-    setTimeout(() => {
-      ["doc1", "doc2", "doc4"].forEach(k => {
-        const wrap = document.getElementById("wrap-" + k);
-        if (wrap) wrap.classList.remove("doc-wrapper-print-hide");
-      });
-    }, 800);
   }
 
   function printPortraitBundle() {
@@ -4337,10 +4545,6 @@
     document.getElementById("wrap-doc4").classList.remove("doc-wrapper-print-hide");
     document.getElementById("sheet-doc1").classList.add("page-break-after");
     window.print();
-    setTimeout(() => {
-      document.getElementById("wrap-doc2").classList.remove("doc-wrapper-print-hide");
-      document.getElementById("sheet-doc1").classList.remove("page-break-after");
-    }, 800);
   }
 
   // 21. Full Workspace Backup & Restore (.json)
@@ -4352,11 +4556,18 @@
     };
     OTHER_INPUT_IDS.forEach(id => { uiInputs[id] = getNumVal(id); });
 
+    const customDocHtml = {
+      doc1: APP_STATE.docEdited.doc1 ? (document.getElementById("sheet-doc1")?.innerHTML || "") : "",
+      doc2: APP_STATE.docEdited.doc2 ? (document.getElementById("sheet-doc2")?.innerHTML || "") : "",
+      doc4: APP_STATE.docEdited.doc4 ? (document.getElementById("sheet-doc4")?.innerHTML || "") : ""
+    };
+
     const backup = {
-      version: "3.4",
+      version: "3.4.1",
       exportedAt: new Date().toISOString(),
       appState: APP_STATE,
-      uiInputs
+      uiInputs,
+      customDocHtml
     };
     triggerJsonDownload(backup, `Peak_RFD01_Workspace_Backup_${Date.now()}.json`);
   }
@@ -4371,7 +4582,7 @@
         if (parsed && parsed.appState) {
           _isRestoringCompanyState = true;
           Object.assign(APP_STATE, parsed.appState);
-          APP_STATE.docEdited = { doc1: false, doc2: false, doc4: false };
+          APP_STATE.docEdited = parsed.appState.docEdited || { doc1: false, doc2: false, doc4: false };
 
           if (APP_STATE.refundType) document.getElementById("refundTypeSelect").value = APP_STATE.refundType;
           if (APP_STATE.fromPeriod) document.getElementById("fromPeriodInput").value = APP_STATE.fromPeriod;
@@ -4391,6 +4602,17 @@
           syncSchemaInputsToUI();
           renderLedgerExplorerTable();
           recalculateAll();
+
+          if (parsed.customDocHtml) {
+            ["doc1", "doc2", "doc4"].forEach(k => {
+              if (APP_STATE.docEdited[k] && parsed.customDocHtml[k]) {
+                const el = document.getElementById("sheet-" + k);
+                if (el) el.innerHTML = parsed.customDocHtml[k];
+              }
+            });
+            saveCustomDocHtmlState();
+          }
+
           logImportMessage("Restored complete workspace backup from " + file.name);
         }
       } catch (err) {
@@ -4401,14 +4623,32 @@
     reader.readAsText(file);
   }
 
-  // 22. Single Clean Boot & Offline Service Worker Registration
+  // 22. Single Clean Boot, PWA Install Prompt & Offline Service Worker Registration
   window.addEventListener("DOMContentLoaded", initApp);
+
+  let _deferredPwaPrompt = null;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    _deferredPwaPrompt = e;
+    const btn = document.getElementById("btnInstallPwa");
+    if (btn) btn.style.display = "inline-flex";
+  });
+
+  async function triggerPwaInstall() {
+    if (!_deferredPwaPrompt) return;
+    _deferredPwaPrompt.prompt();
+    const { outcome } = await _deferredPwaPrompt.userChoice;
+    logImportMessage(`PWA Install prompt outcome: ${outcome}`);
+    _deferredPwaPrompt = null;
+    const btn = document.getElementById("btnInstallPwa");
+    if (btn) btn.style.display = "none";
+  }
 
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
       navigator.serviceWorker.register("./sw.js")
         .then(() => {
-          logImportMessage("✓ Offline PWA Service Worker (sw.js v3.4) active — Logo.png & PDF.js cached for offline use.");
+          logImportMessage("✓ Offline PWA Service Worker (sw.js v3.4.1) active — Logo.png & PDF.js cached for offline use.");
         })
         .catch(err => {
           console.warn("SW registration note (use localhost/HTTPS to enable offline caching):", err.message);
