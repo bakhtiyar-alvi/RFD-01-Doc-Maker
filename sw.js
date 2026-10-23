@@ -3,7 +3,7 @@
    File: sw.js (v3.4.1)
    ===================================================================== */
 
-const CACHE_NAME = "peak-gst-rfd01-pwa-v4.0";
+const CACHE_NAME = "peak-gst-rfd01-pwa-v4.5";
 
 const CORE_ASSETS = [
   "./",
