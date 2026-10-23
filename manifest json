@@ -1,15 +1,14 @@
 {
   "id": "./index.html",
-  "name": "Peak GST RFD-01 Form & Document Maker PWA",
-  "short_name": "Peak RFD-01",
-  "description": "Offline-Ready GST RFD-01 Refund Calculator, Statement 1A & Annexure-B JSON Generator, Electronic Credit/Cash Ledger Parser & Printable Document Studio.",
+  "name": "Peak GST RFD-01 Form & Document Maker",
+  "short_name": "GST RFD-01",
+  "description": "Offline-ready GST RFD-01 Refund Calculator, Portal JSON Generator & Printable Document Studio",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
   "orientation": "any",
   "background_color": "#f1f5f9",
   "theme_color": "#1B365D",
-  "categories": ["finance", "business", "productivity"],
   "icons": [
     {
       "src": "./Logo.png",
@@ -22,6 +21,12 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
+    },
+    {
+      "src": "./Logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
     },
     {
       "src": "./Logo.png",
